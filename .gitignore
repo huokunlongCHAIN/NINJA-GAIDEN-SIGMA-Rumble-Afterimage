@@ -1,0 +1,10 @@
+/build/
+/dist/
+/evidence/
+*.dll
+*.exe
+*.o
+*.zip
+*.log
+icon_data.generated.h
+__pycache__/

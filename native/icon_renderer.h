@@ -1,0 +1,139 @@
+#pragma once
+#include <d3d11.h>
+#include <vector>
+#include <unordered_map>
+#include <mutex>
+#include <atomic>
+#include "MinHook.h"
+#ifdef NGS1_LOCAL_ICONS
+#include "icon_data.generated.h"
+#else
+static constexpr unsigned char kControllerIconData[]{0};
+#endif
+#include "render_hook_bridge.h"
+
+namespace ControllerIcons {
+inline constexpr bool HasIconData = sizeof(kControllerIconData) >= 16;
+struct Run {uint32_t offset;std::vector<BYTE> bytes;};
+struct Patch {uint32_t width,height,size;uint64_t xbox,ps;std::vector<Run> runs;};
+struct Pair {ID3D11ShaderResourceView* xbox;ID3D11ShaderResourceView* ps;ID3D11Texture2D* texture=nullptr;std::vector<BYTE> xboxPixels,psPixels;UINT pitch=0;int applied=0;bool mutableTexture=false;};
+static std::vector<Patch> patches;
+static std::vector<Pair> pairs;
+static std::unordered_map<ID3D11ShaderResourceView*,size_t> views;
+static std::unordered_map<ID3D11Resource*,size_t> textures;
+static std::vector<ID3D11ShaderResourceView*> pending;
+static std::unordered_map<void*,void*> originals;
+static std::unordered_map<void*,unsigned> originalSlots;
+static std::unordered_map<ID3D11DeviceContext*,int> modes;
+static std::recursive_mutex lock;
+static std::atomic<bool> desiredPS{false};
+static std::atomic<bool> enabled{false};
+static std::atomic<const AfterimageDrawHandlers*> afterimage{nullptr};
+static void(*log)(const char*,...);
+static const GUID tag={0x5de32fb4,0x43ba,0x4ab3,{0x99,0x62,0x3c,0x7d,0x85,0x44,0x2e,0xf1}};
+typedef void(STDMETHODCALLTYPE* SetFn)(ID3D11DeviceContext*,UINT,UINT,ID3D11ShaderResourceView* const*);
+typedef void(STDMETHODCALLTYPE* DrawFn)(ID3D11DeviceContext*,UINT,UINT);
+typedef void(STDMETHODCALLTYPE* IndexedFn)(ID3D11DeviceContext*,UINT,UINT,INT);
+typedef void(STDMETHODCALLTYPE* InstancedFn)(ID3D11DeviceContext*,UINT,UINT,UINT,UINT);
+typedef void(STDMETHODCALLTYPE* IndexedInstancedFn)(ID3D11DeviceContext*,UINT,UINT,UINT,INT,UINT);
+typedef void(STDMETHODCALLTYPE* ExecuteFn)(ID3D11DeviceContext*,ID3D11CommandList*,BOOL);
+template<class T>inline T Original(ID3D11DeviceContext* context,unsigned index){void* target=(*reinterpret_cast<void***>(context))[index];return reinterpret_cast<T>(originals.at(target));}
+template<class T>struct Ref {T* p=nullptr;~Ref(){if(p)p->Release();}T** out(){return &p;}T* operator->(){return p;}};
+inline uint64_t Hash(const BYTE* data,size_t size){uint64_t h=14695981039346656037ull;for(size_t i=0;i<size;++i)h=(h^data[i])*1099511628211ull;return h;}
+inline bool Parse(){
+ const BYTE* cursor=kControllerIconData,*end=cursor+sizeof(kControllerIconData);
+ auto read=[&](void* out,size_t n){if(size_t(end-cursor)<n)return false;memcpy(out,cursor,n);cursor+=n;return true;};
+ char magic[8];uint32_t version,count;if(!read(magic,8)||memcmp(magic,"NGSICN02",8)||!read(&version,4)||version!=1||!read(&count,4)||count>16)return false;
+ for(uint32_t i=0;i<count;++i){Patch p{};uint32_t runs;
+  if(!read(&p.width,4)||!read(&p.height,4)||!read(&p.xbox,8)||!read(&p.ps,8)||!read(&p.size,4)||!read(&runs,4)||p.width!=512||(p.height!=32&&p.height!=512)||p.size!=p.width*p.height*4||runs>10000)return false;
+  uint32_t last=0;for(uint32_t n=0;n<runs;++n){Run r{};uint32_t length;if(!read(&r.offset,4)||!read(&length,4)||r.offset<last||length>p.size||r.offset>p.size-length)return false;r.bytes.resize(length);if(!read(r.bytes.data(),length))return false;last=r.offset+length;p.runs.push_back(std::move(r));}patches.push_back(std::move(p));
+ }return cursor==end;
+}
+inline Pair* Find(ID3D11DeviceContext* context,ID3D11ShaderResourceView* view){
+ if(!view)return nullptr;auto known=views.find(view);if(known!=views.end())return &pairs[known->second];if(pairs.size()>=64)return nullptr;
+ Ref<ID3D11Resource> resource;view->GetResource(resource.out());if(!resource.p)return nullptr;
+ Ref<ID3D11Texture2D> texture;if(FAILED(resource->QueryInterface(__uuidof(ID3D11Texture2D),reinterpret_cast<void**>(texture.out()))))return nullptr;
+ auto existing=textures.find(texture.p);if(existing!=textures.end()&&pairs[existing->second].mutableTexture){views[view]=existing->second;return &pairs[existing->second];}
+ D3D11_TEXTURE2D_DESC desc;texture->GetDesc(&desc);if(desc.Width!=512||(desc.Height!=32&&desc.Height!=512)||desc.MipLevels!=1||desc.ArraySize!=1||desc.SampleDesc.Count!=1)return nullptr;
+ if(desc.Format!=DXGI_FORMAT_B8G8R8A8_UNORM&&desc.Format!=DXGI_FORMAT_B8G8R8A8_UNORM_SRGB&&desc.Format!=DXGI_FORMAT_B8G8R8A8_TYPELESS&&desc.Format!=DXGI_FORMAT_R8G8B8A8_UNORM&&desc.Format!=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB&&desc.Format!=DXGI_FORMAT_R8G8B8A8_TYPELESS)return nullptr;
+ UINT marker=0,markerSize=4;if(SUCCEEDED(texture->GetPrivateData(tag,&markerSize,&marker))&&marker==1)return nullptr;
+ if(context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE){if(marker!=2){marker=2;texture->SetPrivateData(tag,4,&marker);view->AddRef();pending.push_back(view);}return nullptr;}
+ D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;view->GetDesc(&srvDesc);if(srvDesc.ViewDimension!=D3D11_SRV_DIMENSION_TEXTURE2D)return nullptr;
+ Ref<ID3D11Device> device;context->GetDevice(device.out());D3D11_TEXTURE2D_DESC stagingDesc=desc;stagingDesc.Usage=D3D11_USAGE_STAGING;stagingDesc.BindFlags=0;stagingDesc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;stagingDesc.MiscFlags=0;
+ Ref<ID3D11Texture2D> staging;if(FAILED(device->CreateTexture2D(&stagingDesc,nullptr,staging.out())))return nullptr;
+ context->CopyResource(staging.p,texture.p);D3D11_MAPPED_SUBRESOURCE mapped{};if(FAILED(context->Map(staging.p,0,D3D11_MAP_READ,0,&mapped)))return nullptr;
+ std::vector<BYTE> pixels(size_t(desc.Width)*desc.Height*4);for(UINT row=0;row<desc.Height;++row)memcpy(pixels.data()+size_t(row)*desc.Width*4,static_cast<BYTE*>(mapped.pData)+size_t(row)*mapped.RowPitch,desc.Width*4);context->Unmap(staging.p,0);
+ uint64_t hash=Hash(pixels.data(),pixels.size());const Patch* match=nullptr;bool wasPS=false;
+ for(const auto& p:patches)if(p.width==desc.Width&&p.height==desc.Height&&(p.xbox==hash||p.ps==hash)){match=&p;wasPS=p.ps==hash;break;}
+ if(!match){static unsigned misses=0;if(log&&misses++<8)log("ICON_CANDIDATE_UNMATCHED width=%u height=%u format=%u hash=%llx",desc.Width,desc.Height,desc.Format,static_cast<unsigned long long>(hash));marker=1;texture->SetPrivateData(tag,4,&marker);return nullptr;}
+ std::vector<BYTE> source=pixels;
+ for(const auto& r:match->runs)for(size_t i=0;i<r.bytes.size();++i)pixels[r.offset+i]^=r.bytes[i];
+ if(Hash(pixels.data(),pixels.size())!=(wasPS?match->xbox:match->ps))return nullptr;
+ if(desc.Usage==D3D11_USAGE_DEFAULT){Pair pair{};pair.xbox=pair.ps=view;view->AddRef();pair.texture=texture.p;pair.texture->AddRef();pair.mutableTexture=true;pair.pitch=desc.Width*4;pair.applied=wasPS?1:0;pair.xboxPixels=wasPS?pixels:source;pair.psPixels=wasPS?source:pixels;size_t index=pairs.size();pairs.push_back(std::move(pair));views[view]=index;textures[texture.p]=index;if(log)log("ICON_TEXTURE_MATCH width=%u height=%u format=%u source=%s mutable=1",desc.Width,desc.Height,desc.Format,wasPS?"PS":"Xbox");return &pairs[index];}
+ D3D11_TEXTURE2D_DESC otherDesc=desc;otherDesc.Usage=D3D11_USAGE_IMMUTABLE;otherDesc.BindFlags=D3D11_BIND_SHADER_RESOURCE;otherDesc.CPUAccessFlags=0;otherDesc.MiscFlags=0;
+ D3D11_SUBRESOURCE_DATA initial{pixels.data(),desc.Width*4,0};Ref<ID3D11Texture2D> other;
+ if(FAILED(device->CreateTexture2D(&otherDesc,&initial,other.out())))return nullptr;
+ ID3D11ShaderResourceView* otherView=nullptr;if(FAILED(device->CreateShaderResourceView(other.p,&srvDesc,&otherView)))return nullptr;
+ view->AddRef();Pair pair{};pair.xbox=wasPS?otherView:view;pair.ps=wasPS?view:otherView;size_t index=pairs.size();pairs.push_back(std::move(pair));views[pairs[index].xbox]=index;views[pairs[index].ps]=index;
+ if(log)log("ICON_TEXTURE_MATCH width=%u height=%u format=%u source=%s pairs=%u",desc.Width,desc.Height,desc.Format,wasPS?"PS":"Xbox",unsigned(pairs.size()));return &pairs[index];
+}
+inline void Sync(ID3D11DeviceContext* context){if(context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return;std::lock_guard<std::recursive_mutex> guard(lock);
+ auto queue=std::move(pending);pending.clear();for(auto view:queue){try{Find(context,view);}catch(...){}view->Release();}
+ int mode=desiredPS?1:0;for(auto& pair:pairs)if(pair.mutableTexture&&pair.applied!=mode){const auto& pixels=mode?pair.psPixels:pair.xboxPixels;context->UpdateSubresource(pair.texture,0,nullptr,pixels.data(),pair.pitch,0);pair.applied=mode;}
+}
+inline void Refresh(ID3D11DeviceContext* context){
+ Sync(context);if(context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return;
+ std::lock_guard<std::recursive_mutex> guard(lock);int mode=desiredPS?1:0;auto previous=modes.find(context);if(previous!=modes.end()&&previous->second==mode)return;
+ ID3D11ShaderResourceView* current[128]{};context->PSGetShaderResources(0,128,current);ID3D11ShaderResourceView* replacement[128]{};bool changed=false;
+ for(unsigned i=0;i<128;++i){replacement[i]=current[i];auto pair=Find(context,current[i]);if(pair&&!pair->mutableTexture){replacement[i]=mode?pair->ps:pair->xbox;changed|=replacement[i]!=current[i];}}
+ if(changed)Original<SetFn>(context,8)(context,0,128,replacement);for(auto view:current)if(view)view->Release();modes[context]=mode;
+}
+static void STDMETHODCALLTYPE Set(ID3D11DeviceContext* context,UINT first,UINT count,ID3D11ShaderResourceView* const* input){
+ auto next=Original<SetFn>(context,8);if(!enabled||!input||count>128){next(context,first,count,input);return;}
+ static std::atomic<unsigned> calls{0};if(calls++<2&&log)log("ICON_SRV_ACTIVITY context_type=%u",context->GetType());
+ try{std::lock_guard<std::recursive_mutex> guard(lock);ID3D11ShaderResourceView* output[128]{};bool ps=desiredPS;
+  for(UINT i=0;i<count;++i){auto pair=Find(context,input[i]);output[i]=pair&&!pair->mutableTexture?(ps?pair->ps:pair->xbox):input[i];}next(context,first,count,output);
+ }catch(...){next(context,first,count,input);}
+}
+static void STDMETHODCALLTYPE Draw(ID3D11DeviceContext* c,UINT n,UINT first){try{if(enabled)Refresh(c);}catch(...){}Original<DrawFn>(c,13)(c,n,first);}
+static void STDMETHODCALLTYPE Indexed(ID3D11DeviceContext* c,UINT n,UINT first,INT vertex){
+ try{if(enabled)Refresh(c);}catch(...){}
+ const auto* handlers=afterimage.load();
+ if(!handlers||!handlers->indexed(c,n,first,vertex))Original<IndexedFn>(c,12)(c,n,first,vertex);
+}
+static void STDMETHODCALLTYPE Instanced(ID3D11DeviceContext* c,UINT n,UINT instances,UINT first,UINT instance){try{if(enabled)Refresh(c);}catch(...){}Original<InstancedFn>(c,21)(c,n,instances,first,instance);}
+static void STDMETHODCALLTYPE IndexedInstanced(ID3D11DeviceContext* c,UINT n,UINT instances,UINT first,INT vertex,UINT instance){
+ try{if(enabled)Refresh(c);}catch(...){}
+ const auto* handlers=afterimage.load();
+ if(!handlers||!handlers->indexedInstanced(c,n,instances,first,vertex,instance))
+  Original<IndexedInstancedFn>(c,20)(c,n,instances,first,vertex,instance);
+}
+static void STDMETHODCALLTYPE Execute(ID3D11DeviceContext* c,ID3D11CommandList* commands,BOOL restore){
+ try{if(enabled)Sync(c);}catch(...){}
+ const auto* handlers=afterimage.load();
+ if(!handlers||!handlers->execute(c,commands,restore))Original<ExecuteFn>(c,58)(c,commands,restore);
+}
+inline void* SharedOriginal(void* target,unsigned slot){
+ if(!enabled||(slot!=12&&slot!=20&&slot!=58))return nullptr;
+ auto found=originalSlots.find(target);
+ return found==originalSlots.end()||found->second!=slot?nullptr:originals.at(target);
+}
+inline void ConnectAfterimage(const AfterimageDrawHandlers* handlers){afterimage=handlers;}
+inline bool Initialize(void(*logger)(const char*,...)){
+ log=logger;if(!Parse())return false;wchar_t path[MAX_PATH];GetSystemDirectoryW(path,MAX_PATH);wcscat_s(path,L"\\d3d11.dll");HMODULE module=LoadLibraryW(path);if(!module)return false;
+ auto create=reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(GetProcAddress(module,"D3D11CreateDevice"));if(!create)return false;
+ Ref<ID3D11Device> device;Ref<ID3D11DeviceContext> context;D3D_FEATURE_LEVEL level=D3D_FEATURE_LEVEL_11_0;
+ HRESULT result=create(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,&level,1,D3D11_SDK_VERSION,device.out(),nullptr,context.out());if(FAILED(result)){if(log)log("ICON_DEVICE_FAILED result=%08lx",result);return false;}
+ Ref<ID3D11DeviceContext> deferred;device->CreateDeferredContext(0,deferred.out());auto table=*reinterpret_cast<void***>(context.p);
+ const unsigned indices[]={8,12,13,20,21,58};void* handlers[]={reinterpret_cast<void*>(Set),reinterpret_cast<void*>(Indexed),reinterpret_cast<void*>(Draw),reinterpret_cast<void*>(IndexedInstanced),reinterpret_cast<void*>(Instanced),reinterpret_cast<void*>(Execute)};
+ std::vector<void*> targets;bool ok=true;
+ for(unsigned row=0;row<(deferred.p?2u:1u)&&ok;++row){auto slots=row?*reinterpret_cast<void***>(deferred.p):table;for(unsigned n=0;n<(row?1u:6u);++n){void* target=slots[indices[n]];if(originals.count(target))continue;void* original=nullptr;auto status=MH_CreateHook(target,handlers[n],&original);if(status!=MH_OK){ok=false;break;}originals[target]=original;originalSlots[target]=indices[n];targets.push_back(target);}}
+ auto rollback=[&]{enabled=false;for(auto target:targets)MH_RemoveHook(target);originals.clear();originalSlots.clear();return false;};
+ if(!ok){if(log)log("ICON_HOOK_CREATE_FAILED made=%u",unsigned(targets.size()));return rollback();}
+ for(auto target:targets)if(MH_QueueEnableHook(target)!=MH_OK)return rollback();
+ enabled=true;
+ if(MH_ApplyQueued()!=MH_OK)return rollback();
+ if(log)log("ICON_RENDERER_READY variants=%u",unsigned(patches.size()));return true;
+}
+inline void Select(bool ps){bool old=desiredPS.exchange(ps);if(old!=ps&&log)log("ICON_MODE target=%s",ps?"PS":"Xbox");}
+}
