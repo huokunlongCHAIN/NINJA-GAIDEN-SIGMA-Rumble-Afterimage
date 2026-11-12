@@ -677,9 +677,8 @@ bool PrepareGhost(ID3D11Device* device, DeviceResources& res) {
             float4 main(float4 pos : SV_Position) : SV_Target { return float4(underlayLight(pos).xxx, 1); }
         )";
         const std::string gripUnderlay = std::string(underlayLighting) + GripSkinMask + R"(
-            cbuffer FadeLighting : register(b12) { float skinLevel; }
             float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-                float light = underlayLight(pos) * (gripSkin(uv) ? skinLevel : 0.54);
+                float light = underlayLight(pos) * (gripSkin(uv) ? 1.0 : 0.0);
                 return float4(light.xxx, 1);
             }
         )";
@@ -1124,28 +1123,18 @@ bool InspectDraw(Context* c, const Draw& draw) {
         // screen-space trails still yield to its foreground mask.
         const auto surface = activeCostume == Costume::Black ? ClassifyGhostMaterial(key) : mesh->material;
         const bool gripAtlas = surface == GhostMaterial::GripAtlas;
-        const float skin = 0.54f + 0.46f * settings.muscleHighlight / 100.0f;
-        const float material = gripAtlas ? 1.0f : (surface == GhostMaterial::Skin ? skin : 0.54f);
-        const float intensity = material * settings.alpha * (1.0f + settings.glowStrength / 100.0f) * (1 - body) / 25500.0f;
-        const FLOAT blue[]{settings.tint[0] * intensity * 0.70f,
-            settings.tint[1] * intensity * 0.83f, settings.tint[2] * intensity, 0};
+        const float skinBoost = 0.46f * settings.muscleHighlight / 100.0f;
+        const float intensity = settings.alpha * (1.0f + settings.glowStrength / 100.0f) * (1 - body) / 25500.0f;
         auto setPS = Original<SetPS>(c, PsShader);
-        ComPtr<ID3D11Buffer> previousLighting;
-        auto setConstants = Original<SetBuffers>(c, PsConstants);
-        if (gripAtlas) {
-            c->PSGetConstantBuffers(ColorSlot - 1, 1, previousLighting.GetAddressOf());
-            auto* lighting = res.ghostLighting.Get();
-            const FLOAT level[4]{skin};
-            c->UpdateSubresource(lighting, 0, nullptr, level, 0, 0);
-            setConstants(c, ColorSlot - 1, 1, &lighting);
-        }
-        setPS(c, gripAtlas ? res.gripFadeUnderlay.Get() : res.fadeUnderlay.Get(), nullptr, 0);
-        setBlend(c, res.fadeUnderlayBlend.Get(), blue, state.sampleMask);
-        CallDraw(c, draw);
-        if (gripAtlas) {
-            auto* lighting = previousLighting.Get();
-            setConstants(c, ColorSlot - 1, 1, &lighting);
-        }
+        auto drawUnderlay = [&](ID3D11PixelShader* shader, float level) {
+            const FLOAT blue[]{settings.tint[0] * intensity * level * 0.70f,
+                settings.tint[1] * intensity * level * 0.83f, settings.tint[2] * intensity * level, 0};
+            setPS(c, shader, nullptr, 0);
+            setBlend(c, res.fadeUnderlayBlend.Get(), blue, state.sampleMask);
+            CallDraw(c, draw);
+        };
+        drawUnderlay(res.fadeUnderlay.Get(), 0.54f + (surface == GhostMaterial::Skin ? skinBoost : 0));
+        if (gripAtlas && skinBoost > 0) drawUnderlay(res.gripFadeUnderlay.Get(), skinBoost);
         setPS(c, state.ps, nullptr, 0);
     }
     setBlend(c, res.fadeBlend.Get(), factors, state.sampleMask);
