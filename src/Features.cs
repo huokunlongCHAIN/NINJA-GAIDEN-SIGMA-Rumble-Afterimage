@@ -9,11 +9,12 @@ using System.Threading;
 namespace NgsRumblePatch {
 public sealed class FeatureInspection {
  public string Root,Description,ConfigRoot;public bool CanInstall,CanInstallAfterimage,CanRestore,Rumble,DualSense,Afterimage,AfterimageMaterials;
- public int MaxSurfaceBrightness=100;
+ public int MaxSurfaceBrightness=100,MaxGlowStrength=100;
 }
 public enum AfterimageMaterial { Classic, Sigma2 }
 public sealed class AfterimagePreset {
  public const int MaxSurfaceBrightness=200;
+ public const int MaxSigma2GlowStrength=200;
  public int Brightness=68,SurfaceBrightness=100,Opacity=40,Red=144,Green=163,Blue=253;
  public int MuscleHighlight=45;
  public static readonly string[] Sections={"Afterimage.Black","Afterimage.Purple","Afterimage.Blue","Afterimage.Ashtar","Afterimage.Grip"};
@@ -43,7 +44,7 @@ public sealed class AfterimagePreset {
  public static AfterimagePreset Read(string ini,int costume,AfterimageMaterial material=AfterimageMaterial.Classic){
   string section=Section(costume,material);
   return new AfterimagePreset{
-   Brightness=Number(ini,section,"GlowStrengthPercent",68,100),
+   Brightness=Number(ini,section,"GlowStrengthPercent",68,material==AfterimageMaterial.Sigma2?MaxSigma2GlowStrength:100),
    SurfaceBrightness=Number(ini,section,"SurfaceBrightnessPercent",100,MaxSurfaceBrightness),
    Opacity=Number(ini,section,"OpacityPercent",40,100),
    MuscleHighlight=ShowsMuscleHighlight(costume)?Number(ini,section,"MuscleHighlightPercent",45,100):0,
@@ -52,7 +53,8 @@ public sealed class AfterimagePreset {
  }
  public string Write(string ini,int costume,AfterimageMaterial material=AfterimageMaterial.Classic){
   string section=Section(costume,material);
-  foreach(var setting in new[]{new{Key="GlowStrengthPercent",Value=Brightness,Max=100},new{Key="OpacityPercent",Value=Opacity,Max=100},
+  int maxGlow=material==AfterimageMaterial.Sigma2?MaxSigma2GlowStrength:100;
+  foreach(var setting in new[]{new{Key="GlowStrengthPercent",Value=Brightness,Max=maxGlow},new{Key="OpacityPercent",Value=Opacity,Max=100},
    new{Key="TintR",Value=Red,Max=255},new{Key="TintG",Value=Green,Max=255},new{Key="TintB",Value=Blue,Max=255}}){
    if(setting.Value<0||setting.Value>setting.Max)throw new ArgumentOutOfRangeException(setting.Key);
    ini=FeatureIni.Set(ini,section,setting.Key,setting.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
@@ -103,6 +105,7 @@ public sealed class FeatureFacade {
    Version version;
    info.AfterimageMaterials=Version.TryParse(journal.Version,out version)&&version>=new Version(0,6,7);
    info.MaxSurfaceBrightness=info.AfterimageMaterials&&version>=new Version(0,6,8)?AfterimagePreset.MaxSurfaceBrightness:100;
+   info.MaxGlowStrength=info.AfterimageMaterials&&version>=new Version(0,6,9)?AfterimagePreset.MaxSigma2GlowStrength:100;
   }catch(Exception e){info.CanInstall=info.CanInstallAfterimage=false;info.Description=e.Message;}
   return info;
  }
@@ -164,8 +167,10 @@ public sealed class FeatureFacade {
    if(!info.Afterimage||!info.CanInstallAfterimage)throw new Exception(InstallerLanguage.T("请先在这个目录安装残影补丁。", "Install afterimages for this game folder first."));
    if(material==AfterimageMaterial.Sigma2&&!info.AfterimageMaterials)
     throw new Exception(InstallerLanguage.T("请先更新残影补丁。","Update the afterimage patch first."));
-   if(material==AfterimageMaterial.Sigma2&&preset.SurfaceBrightness>info.MaxSurfaceBrightness)
-    throw new Exception(InstallerLanguage.T("请更新残影补丁以使用超过 100% 的材质亮度。","Update afterimages to use surface brightness above 100%."));
+   if(material==AfterimageMaterial.Sigma2&&
+    (preset.SurfaceBrightness>info.MaxSurfaceBrightness||preset.Brightness>info.MaxGlowStrength))
+    throw new Exception(InstallerLanguage.T("请先点击「安装／更新残影」，再保存超过旧版上限的设置。",
+     "Choose Install / Update Afterimages before saving values above the installed version's limits."));
    string file=PatchEngine.Child(info.ConfigRoot,"NGS1Rumble.ini");
    string text=preset.Write(File.ReadAllText(file),costume,material);
    if(info.AfterimageMaterials)text=FeatureIni.Set(text,"Afterimage","Material",material.ToString());

@@ -40,7 +40,7 @@ static class IntegratedTests {
    InstallPrevious(args[1],root,"--install-ps5");
    InstallPrevious(args[1],root,"--install-afterimage");
    var before=features.Inspect(root);
-   Check(before.Rumble&&before.DualSense&&before.Afterimage&&before.MaxSurfaceBrightness==100,"Previous feature flags not loaded correctly.");
+   Check(before.Rumble&&before.DualSense&&before.Afterimage&&before.MaxGlowStrength==100,"Previous feature flags not loaded correctly.");
    var customClassic=new AfterimagePreset{Brightness=73,Opacity=29,Red=77,Green=88,Blue=99,MuscleHighlight=30};
    features.SavePreset(root,0,customClassic);
    string rules=Path.Combine(before.ConfigRoot,"NGS1RumbleRules.ini");
@@ -49,7 +49,8 @@ static class IntegratedTests {
    features.InstallAfterimage(root);
    var installed=features.Inspect(root);
    Check(installed.Rumble&&installed.DualSense&&installed.Afterimage&&installed.AfterimageMaterials&&
-    installed.MaxSurfaceBrightness==200,"Afterimage upgrade changed controller features or did not raise the brightness limit.");
+    installed.MaxSurfaceBrightness==200&&installed.MaxGlowStrength==200,
+    "Afterimage upgrade changed controller features or did not raise both Sigma2 limits.");
    Check(FeatureIni.Get(File.ReadAllText(Path.Combine(installed.ConfigRoot,"NGS1Rumble.ini")),
     "Features","AutoIcons","0")=="1","The public installer did not enable built-in DualSense icons.");
    Check(Payload.FileHash(rules)==ruleHash,"Afterimage upgrade changed rumble rules.");
@@ -61,7 +62,7 @@ static class IntegratedTests {
     Check(features.LoadPreset(root,i,AfterimageMaterial.Sigma2).Opacity==40,"Sigma2 default preset differs.");
     features.SavePreset(root,i,new AfterimagePreset{Brightness=i*25,Opacity=100-i*17,
      MuscleHighlight=20+i*15,Red=245-i,Green=30+i,Blue=15+i});
-    features.SavePreset(root,i,new AfterimagePreset{Brightness=15+i*20,Opacity=35+i*7,
+    features.SavePreset(root,i,new AfterimagePreset{Brightness=120+i*20,Opacity=35+i*7,
      SurfaceBrightness=120+i*20,MuscleHighlight=44-i*5,Red=132+i,Green=150+i,Blue=210+i},AfterimageMaterial.Sigma2);
    }
    features.InstallAfterimage(root);
@@ -72,7 +73,7 @@ static class IntegratedTests {
     bool exposed=i==0||i==2||i==4;
     Check(AfterimagePreset.ShowsMuscleHighlight(i)==exposed&&preset.MuscleHighlight==(exposed?20+i*15:0),"Costume-specific highlight lost or applied incorrectly.");
     var sigma2=features.LoadPreset(root,i,AfterimageMaterial.Sigma2);
-    Check(sigma2.Brightness==15+i*20&&sigma2.SurfaceBrightness==120+i*20&&sigma2.Opacity==35+i*7&&
+    Check(sigma2.Brightness==120+i*20&&sigma2.SurfaceBrightness==120+i*20&&sigma2.Opacity==35+i*7&&
      sigma2.Red==132+i&&sigma2.Green==150+i&&sigma2.Blue==210+i&&sigma2.MuscleHighlight==(exposed?44-i*5:0),
      "Sigma2 settings were not kept separately for each costume.");
    }

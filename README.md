@@ -10,7 +10,7 @@
 
 右上角可即时切换简体中文和 English，安装器会记住上次选择。安装包附有中英文使用说明。
 
-「残影」页提供「原版材质」和带有透景折射的「sigma2 材质」。两种材质在五套服装上各自保存发光强度、颜色和透明度。「sigma2 材质」的材质亮度可调至 200%。默认黑衣、蓝色传说忍者服和杀戮凶手提供肌肉高亮调节，默认 45%。点击「保存并应用材质」后，游戏自动重载。
+「残影」页提供「原版材质」和带有透景折射的「sigma2 材质」。两种材质在五套服装上各自保存发光强度、颜色和透明度。sigma2 的材质亮度和发光强度均可调至 200%，各自的渲染强度是 100% 的两倍。先安装／更新残影运行库，再点击「保存并应用材质」热重载设置。默认黑衣、蓝色传说忍者服和杀戮凶手提供肌肉高亮调节，默认 45%。残影根据场景深度遮挡。
 
 ## 从源码构建
 
@@ -42,4 +42,4 @@ Download the ZIP from Releases, exit the game, and run `NGS1RumblePatch.exe`. Ch
 
 The public package supports verified 1.0.0.2 and 1.0.0.4 builds, including the tested 1.0.0.4 Chinese localization. Installing DualSense support also enables automatic PlayStation/Xbox button icons. The source build commands above use PowerShell 7 and x64 LLVM with MinGW.
 
-The Afterimages tab offers Classic and refractive sigma2 materials, with separate glow strength, color and transparency settings for all five costumes. Sigma2 surface brightness can reach 200%. **Save and Apply Material** reloads the appearance in a running game.
+The Afterimages tab offers Classic and refractive sigma2 materials, with separate glow strength, color and transparency settings for all five costumes. Sigma2 surface brightness and glow strength both reach 200%, with twice the corresponding contribution at 100%. Afterimages are occluded using scene depth. After updating the runtime, **Save and Apply Material** reloads the appearance in a running game.

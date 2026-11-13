@@ -100,6 +100,8 @@ int main() {
     ComPtr<ID3D11DeviceContext1> context1;
     assert(SUCCEEDED(immediate.As(&context1)));
     ComPtr<ID3D11VertexShader> curvedShader;
+    ComPtr<ID3D11DepthStencilView> obstacle;
+    bool clearObstacleBeforePresent = false;
     auto draw = [&](unsigned strength, float anchorOpacity = 0, unsigned fadeStep = FadeSteps - 1,
         unsigned distortion = 0, bool seam = false, bool playerFront = false,
         GhostMaterial material = GhostMaterial::Fabric) {
@@ -113,6 +115,12 @@ int main() {
         }
         auto* rtv = propTarget.Get();
         immediate->OMSetRenderTargets(1, &rtv, nullptr);
+        if (obstacle) {
+            const D3D11_VIEWPORT viewport{0, 0, float(Size), float(Size), 0, 1};
+            RememberSceneDepth(device.Get(), res.sceneDepth, obstacle.Get(), nullptr, viewport);
+            if (clearObstacleBeforePresent)
+                immediate->ClearDepthStencilView(obstacle.Get(), D3D11_CLEAR_DEPTH, 1, 0);
+        }
         packet.pose.renderFrame = renderFrame;
         packet.anchorOpacity = anchorOpacity;
         packet.color = res.colors[fadeStep];
@@ -372,7 +380,7 @@ int main() {
         assert(WritePrivateProfileStringW(sigma2Sections[i], L"SurfaceBrightnessPercent",
             std::to_wstring(196 + i).c_str(), tempIni));
         assert(WritePrivateProfileStringW(sigma2Sections[i], L"GlowStrengthPercent",
-            std::to_wstring(50 + i).c_str(), tempIni));
+            std::to_wstring(196 + i).c_str(), tempIni));
         assert(WritePrivateProfileStringW(sigma2Sections[i], L"OpacityPercent",
             std::to_wstring(60 + i).c_str(), tempIni));
     }
@@ -381,7 +389,7 @@ int main() {
     for (unsigned i = 0; i < std::size(Costumes); ++i) {
         activeCostume = static_cast<Costume>(i);
         ApplyAppearance();
-        assert(settings.brightness == 196 + i && settings.glowStrength == 50 + i && settings.alpha == 60 + i);
+        assert(settings.brightness == 196 + i && settings.glowStrength == 196 + i && settings.alpha == 60 + i);
     }
     assert(WritePrivateProfileStringW(L"Afterimage", L"Material", L"Classic", tempIni));
     ReadSettings();
@@ -437,13 +445,48 @@ int main() {
     const auto emissive = draw(100);
     settings.brightness = 200;
     const auto brighter = draw(0);
-    assert(bright[4][2] > dark[4][2] && emissive[4][2] > bright[4][2] && brighter[4][2] > bright[4][2]);
+    settings.brightness = 100;
+    const auto strongerGlow = draw(200);
+    assert(bright[4][2] > dark[4][2] && emissive[4][2] > bright[4][2]);
+    assert(std::abs(int(brighter[4][2]) - 2 * int(bright[4][2]) + int(dark[4][2])) <= 2);
+    assert(std::abs(int(strongerGlow[4][2]) - 2 * int(emissive[4][2]) + int(bright[4][2])) <= 2);
     const auto disabledGlass = draw(0, 0, FadeSteps - 1, 0);
     assert(disabledGlass[1] == prop && disabledGlass[2] == prop && disabledGlass[3] == prop);
     assert(res.refraction.maskFormat == DXGI_FORMAT_R8G8B8A8_UNORM);
     settings.glassVisual = false;
     draw(0);
     assert(res.refraction.maskFormat == DXGI_FORMAT_R8G8_UNORM);
+    auto depthDesc = MaskDescription();
+    depthDesc.Width = depthDesc.Height = Size;
+    depthDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    depthDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    ComPtr<ID3D11Texture2D> depthTexture;
+    std::array<UINT, Size * Size> splitDepth{};
+    for (unsigned y = 0; y < Size; ++y)
+        for (unsigned x = 0; x < Size; ++x)
+            splitDepth[y * Size + x] = x < Size / 2 ? 0x00333333u : 0x00ccccccu;
+    const D3D11_SUBRESOURCE_DATA initialDepth{splitDepth.data(), Size * sizeof(UINT), 0};
+    assert(SUCCEEDED(device->CreateTexture2D(&depthDesc, &initialDepth, depthTexture.GetAddressOf())));
+    assert(SUCCEEDED(device->CreateDepthStencilView(depthTexture.Get(), nullptr, obstacle.GetAddressOf())));
+    ComPtr<ID3D11Texture2D> splitScene;
+    assert(SUCCEEDED(device->CreateTexture2D(&depthDesc, &initialDepth, splitScene.GetAddressOf())));
+    for (bool sigma2 : {false, true}) {
+        settings.glassVisual = sigma2;
+        auto visibleEdge = draw(100);
+        assert(visibleEdge[6] == prop && visibleEdge[0] != prop);
+        immediate->ClearDepthStencilView(obstacle.Get(), D3D11_CLEAR_DEPTH, 0.8f, 0);
+        const auto inFront = draw(100);
+        assert(inFront[0] != prop);
+        immediate->ClearDepthStencilView(obstacle.Get(), D3D11_CLEAR_DEPTH, 0.2f, 0);
+        const auto behind = draw(100);
+        assert(behind[0] == prop);
+        clearObstacleBeforePresent = true;
+        const auto preserved = draw(100);
+        assert(res.sceneDepth.frozen && preserved[0] == prop);
+        clearObstacleBeforePresent = false;
+        immediate->CopyResource(depthTexture.Get(), splitScene.Get());
+    }
+    puts("Both materials hide the part of a pose behind scene depth, including depth cleared before Present.");
     puts("Glass style preserves background detail, bends it along the surface, and protects the live silhouette.");
     hooksReady = false;
     MH_Uninitialize();

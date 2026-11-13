@@ -57,6 +57,9 @@ sealed class FeatureForm:Form {
  public FeatureForm(string initial=null){
   Bind(this,"西格玛1 · 功能补丁 "+Payload.Version,"Ninja Gaiden Sigma Enhancements "+Payload.Version);
   ClientSize=new Size(880,800);MinimumSize=new Size(810,680);StartPosition=FormStartPosition.CenterScreen;Font=new Font("Microsoft YaHei UI",10);BackColor=Color.FromArgb(23,29,38);ForeColor=Color.White;
+  var installerIcon=InstallerIcon.Create();
+  Icon=installerIcon;
+  Disposed+=(s,e)=>installerIcon.Dispose();
   var page=new TableLayoutPanel{Dock=DockStyle.Fill,Padding=new Padding(24),ColumnCount=1,RowCount=6};
   foreach(int height in new[]{48,48,48})page.RowStyles.Add(new RowStyle(SizeType.Absolute,height));
   page.RowStyles.Add(new RowStyle(SizeType.Percent,100));
@@ -111,7 +114,7 @@ sealed class FeatureForm:Form {
   outfit.DropDownStyle=ComboBoxStyle.DropDownList;
   outfit.SelectedIndexChanged+=(s,e)=>{if(!translating)RefreshPreset();};
   visuals.Controls.Add(Field("服装","Costume",outfit),0,2);
-  foreach(var number in new[]{brightness,transparency,muscleHighlight}){number.Minimum=0;number.Maximum=100;}
+  foreach(var number in new[]{transparency,muscleHighlight}){number.Minimum=0;number.Maximum=100;}
   surfaceBrightness.Minimum=0;
   surfaceBrightness.Maximum=AfterimagePreset.MaxSurfaceBrightness;
   surfaceBrightnessRow=Field("材质亮度（%）","Surface brightness (%)",surfaceBrightness);
@@ -136,6 +139,11 @@ sealed class FeatureForm:Form {
   details.Dock=DockStyle.Fill;details.Multiline=true;details.ReadOnly=true;details.ScrollBars=ScrollBars.Vertical;details.BackColor=Color.FromArgb(30,38,50);details.ForeColor=Color.Gainsboro;details.BorderStyle=BorderStyle.None;page.Controls.Add(details,0,4);
   var actions=new FlowLayoutPanel{Dock=DockStyle.Fill,Margin=new Padding(0,8,0,0)};launch=Button("启动游戏","Launch Game");launch.Width=220;launch.Click+=async(s,e)=>await Run(root=>String.Format(InstallerLanguage.T("游戏已启动，进程 {0}","Game launched. Process ID {0}."),engine.Launch(root)));restoreAll=Button("全部还原","Restore All");restoreAll.Width=180;restoreAll.Click+=async(s,e)=>await Run(root=>engine.RestoreAll(root));actions.Controls.Add(launch);actions.Controls.Add(restoreAll);page.Controls.Add(actions,0,5);
   ApplyLanguage();
+  browse.Glyph=ButtonGlyph.Folder;
+  foreach(var button in new[]{installRumble,installDS,installAfterimage})button.Glyph=ButtonGlyph.Download;
+  foreach(var button in new[]{restoreRumble,restoreDS,restoreAfterimage,restoreAll})button.Glyph=ButtonGlyph.Restore;
+  savePreset.Glyph=ButtonGlyph.Save;
+  launch.Glyph=ButtonGlyph.Play;
   SetEnabled(false);Shown+=(s,e)=>{if(!String.IsNullOrWhiteSpace(initial))path.Text=initial;else{string here=AppDomain.CurrentDomain.BaseDirectory;var parent=Directory.GetParent(here.TrimEnd(Path.DirectorySeparatorChar));foreach(string root in new[]{here,parent==null?here:parent.FullName})if(File.Exists(Path.Combine(root,Payload.ExeName))){path.Text=root;break;}}RefreshState();};
  }
  static TableLayoutPanel Section(params int[] heights){
@@ -193,6 +201,7 @@ sealed class FeatureForm:Form {
   if(outfit.SelectedIndex<0)return;
   bool showMuscle=AfterimagePreset.ShowsMuscleHighlight(outfit.SelectedIndex);
   bool showSurfaceBrightness=SelectedMaterial==AfterimageMaterial.Sigma2;
+  brightness.Maximum=showSurfaceBrightness?AfterimagePreset.MaxSigma2GlowStrength:100;
   surfaceBrightnessRow.Visible=showSurfaceBrightness;
   visuals.RowStyles[3].Height=showSurfaceBrightness?38:0;
   muscleRow.Visible=showMuscle;
@@ -202,12 +211,11 @@ sealed class FeatureForm:Form {
   catch(Exception error){details.Text=error.Message;}
   brightness.Value=preset.Brightness;transparency.Value=100-preset.Opacity;SetTint(Color.FromArgb(preset.Red,preset.Green,preset.Blue));
   muscleHighlight.Value=preset.MuscleHighlight;
-  surfaceBrightness.Value=Math.Min(preset.SurfaceBrightness,surfaceBrightness.Maximum);
+  surfaceBrightness.Value=preset.SurfaceBrightness;
  }
  void RefreshState(bool refreshPreset=true){
   bool hasPath=!String.IsNullOrWhiteSpace(path.Text);
   var info=hasPath?engine.Inspect(path.Text):new FeatureInspection();
-  surfaceBrightness.Maximum=info.MaxSurfaceBrightness;
   if(refreshPreset){
    translating=true;
    try{material.SelectedIndex=info.AfterimageMaterials?(int)engine.LoadMaterial(path.Text):0;}
@@ -221,6 +229,8 @@ sealed class FeatureForm:Form {
   rumbleState.Text=InstallerLanguage.T("震动补丁","Rumble")+InstalledSuffix(info.Rumble);
   dsState.Text=InstallerLanguage.T("PS5 手柄＋自动图标","DualSense + Icons")+InstalledSuffix(info.DualSense);
   afterimageState.Text=InstallerLanguage.T("服装残影","Costume Afterimages")+InstalledSuffix(info.Afterimage);
+  if(info.Afterimage&&info.MaxGlowStrength<AfterimagePreset.MaxSigma2GlowStrength)
+   afterimageState.Text+=InstallerLanguage.T(" · 可更新"," · Update available");
   installRumble.Enabled=installDS.Enabled=info.CanInstall;restoreRumble.Enabled=info.Rumble;restoreDS.Enabled=info.DualSense;
   installAfterimage.Enabled=info.CanInstallAfterimage;restoreAfterimage.Enabled=info.Afterimage;
   outfit.Enabled=brightness.Enabled=transparency.Enabled=pickColor.Enabled=muscleHighlight.Enabled=savePreset.Enabled=info.Afterimage&&info.CanInstallAfterimage;

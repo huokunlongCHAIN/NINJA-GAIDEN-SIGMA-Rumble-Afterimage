@@ -42,12 +42,13 @@ constexpr unsigned FadeSteps = 24;
 constexpr unsigned PoseHistorySize = 12;
 constexpr unsigned MaxGhostLayers = 12;
 constexpr unsigned MaxSurfaceBrightness = 200;
+constexpr unsigned MaxSigma2GlowStrength = 200;
 
 enum Slot : unsigned {
     VsConstants = 7, PsShader = 9, VsShader = 11, Indexed = 12,
     PsConstants = 16, InputLayout = 17, VertexBuffers = 18, IndexBuffer = 19, IndexedInstanced = 20, Topology = 24,
     Targets = 33, TargetsAndUavs = 34, Blend = 35, Depth = 36,
-    Viewports = 44, Execute = 58, Clear = 110, Finish = 114
+    Viewports = 44, ClearDepthView = 53, Execute = 58, Clear = 110, Finish = 114
 };
 
 using SetBuffers = void (STDMETHODCALLTYPE*)(Context*, UINT, UINT, ID3D11Buffer* const*);
@@ -62,6 +63,7 @@ using SetTargetsUav = void (STDMETHODCALLTYPE*)(Context*, UINT, ID3D11RenderTarg
 using SetBlend = void (STDMETHODCALLTYPE*)(Context*, ID3D11BlendState*, const FLOAT*, UINT);
 using SetDepth = void (STDMETHODCALLTYPE*)(Context*, ID3D11DepthStencilState*, UINT);
 using SetViewport = void (STDMETHODCALLTYPE*)(Context*, UINT, const D3D11_VIEWPORT*);
+using ClearDepth = void (STDMETHODCALLTYPE*)(Context*, ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
 using DrawIndexed = void (STDMETHODCALLTYPE*)(Context*, UINT, UINT, INT);
 using DrawIndexedInstanced = void (STDMETHODCALLTYPE*)(Context*, UINT, UINT, UINT, INT, UINT);
 using ExecuteList = void (STDMETHODCALLTYPE*)(Context*, ID3D11CommandList*, BOOL);
@@ -176,6 +178,18 @@ struct RefractionResources {
     bool unavailable = false;
 };
 
+struct SceneDepth {
+    ComPtr<ID3D11Texture2D> source, snapshot;
+    ComPtr<ID3D11DepthStencilView> sourceView;
+    ComPtr<ID3D11ShaderResourceView> view;
+    D3D11_TEXTURE2D_DESC desc{};
+    D3D11_VIEWPORT viewport{};
+    UINT subresource = 0;
+    uint64_t frame = UINT64_MAX;
+    bool reversed = false;
+    bool frozen = false;
+};
+
 struct DeviceResources {
     ComPtr<ID3D11PixelShader> maskShader;
     ComPtr<ID3D11PixelShader> ghostShader;
@@ -187,6 +201,7 @@ struct DeviceResources {
     ComPtr<ID3D11PixelShader> gripFadeUnderlay;
     ComPtr<ID3D11BlendState> fadeUnderlayBlend;
     ComPtr<ID3D11Buffer> ghostLighting;
+    ComPtr<ID3D11Buffer> sceneDepthConstants;
     ComPtr<ID3D11Texture2D> mask;
     ComPtr<ID3D11RenderTargetView> maskTarget;
     ComPtr<Context> overlayContext;
@@ -195,6 +210,7 @@ struct DeviceResources {
     ComPtr<ID3D11DepthStencilView> overlayCoverage;
     D3D11_TEXTURE2D_DESC coverageDesc{};
     RefractionResources refraction;
+    SceneDepth sceneDepth;
     std::vector<OverlayDraw> overlayDraws;
     std::array<PoseFrame, PoseHistorySize> trail;
     unsigned nextTrail = 0;
@@ -577,6 +593,28 @@ void STDMETHODCALLTYPE TrackViewport(Context* c, UINT count, const D3D11_VIEWPOR
     Original<SetViewport>(c, Viewports)(c, count, viewport);
 }
 
+void CopySceneDepth(Context* c, const SceneDepth& depth) {
+    c->CopySubresourceRegion(depth.snapshot.Get(), 0, 0, 0, 0, depth.source.Get(), depth.subresource, nullptr);
+}
+
+void STDMETHODCALLTYPE ObserveClearDepth(Context* c, ID3D11DepthStencilView* view, UINT flags, FLOAT value, UINT8 stencil) {
+    std::lock_guard<std::recursive_mutex> guard(renderMutex);
+    if (!drawingExtra && settings.enabled && (flags & D3D11_CLEAR_DEPTH)) {
+        ComPtr<ID3D11Device> device;
+        c->GetDevice(device.GetAddressOf());
+        const auto found = resources.find(device.Get());
+        if (found != resources.end()) {
+            auto& depth = found->second.sceneDepth;
+            if (depth.frame == renderFrame && !depth.frozen && view == depth.sourceView.Get() && depth.snapshot) {
+                // Preserve geometry depth before a later UI/postprocess pass clears it.
+                CopySceneDepth(c, depth);
+                depth.frozen = true;
+            }
+        }
+    }
+    Original<ClearDepth>(c, ClearDepthView)(c, view, flags, value, stencil);
+}
+
 void STDMETHODCALLTYPE TrackClear(Context* c) {
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
     auto& state = contexts[c];
@@ -632,20 +670,41 @@ constexpr char GripSkinMask[] = R"(
     }
 )";
 
+constexpr char SceneOcclusion[] = R"(
+    Texture2D<float> sceneDepth : register(t2);
+    cbuffer SceneOcclusion : register(b10) {
+        float2 depthScale;
+        float depthDirection;
+        float depthBias;
+    }
+    void occlude(float4 pos) {
+        if (depthDirection != 0) {
+            float nearest = sceneDepth.Load(int3(int2(pos.xy * depthScale), 0));
+            clip(depthBias + (nearest - pos.z) * depthDirection);
+        }
+    })";
+
 bool PrepareGhost(ID3D11Device* device, DeviceResources& res) {
-    constexpr char shader[] = R"(
+    const std::string shader = std::string(SceneOcclusion) + R"(
         cbuffer GhostLighting : register(b12) { float anchorOpacity; float brightness; }
         cbuffer GhostColor : register(b13) { float4 color; }
-        float4 main() : SV_Target {
+        float4 main(float4 pos : SV_Position) : SV_Target {
+            occlude(pos);
             float opacity = anchorOpacity > 0 ? anchorOpacity : color.a;
             return float4(color.rgb * (opacity * brightness), opacity);
         })";
-    if (!res.ghostShader && !CreateShader(device, shader, res.ghostShader)) return false;
+    if (!res.ghostShader && !CreateShader(device, shader.c_str(), res.ghostShader)) return false;
     if (!res.ghostLighting) {
         D3D11_BUFFER_DESC desc{};
         desc.ByteWidth = 16;
         desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         if (FAILED(device->CreateBuffer(&desc, nullptr, res.ghostLighting.GetAddressOf()))) return false;
+    }
+    if (!res.sceneDepthConstants) {
+        D3D11_BUFFER_DESC desc{};
+        desc.ByteWidth = 16;
+        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(device->CreateBuffer(&desc, nullptr, res.sceneDepthConstants.GetAddressOf()))) return false;
     }
     if (!res.readDepth) {
         D3D11_DEPTH_STENCIL_DESC depth{};
@@ -1070,6 +1129,69 @@ const CostumeMesh* ObserveCostume(uint64_t key) {
     return nullptr;
 }
 
+void RememberSceneDepth(ID3D11Device* device, SceneDepth& depth, ID3D11DepthStencilView* view,
+    ID3D11DepthStencilState* state, const D3D11_VIEWPORT& viewport) {
+    if (!view || depth.frame == renderFrame) return;
+    D3D11_DEPTH_STENCIL_DESC mode{};
+    if (state) {
+        state->GetDesc(&mode);
+        if (!mode.DepthEnable || (mode.DepthFunc != D3D11_COMPARISON_LESS &&
+            mode.DepthFunc != D3D11_COMPARISON_LESS_EQUAL && mode.DepthFunc != D3D11_COMPARISON_EQUAL &&
+            mode.DepthFunc != D3D11_COMPARISON_GREATER && mode.DepthFunc != D3D11_COMPARISON_GREATER_EQUAL)) return;
+    }
+    D3D11_DEPTH_STENCIL_VIEW_DESC binding{};
+    view->GetDesc(&binding);
+    if (binding.ViewDimension != D3D11_DSV_DIMENSION_TEXTURE2D) return;
+    ComPtr<ID3D11Resource> resource;
+    ComPtr<ID3D11Texture2D> texture;
+    view->GetResource(resource.GetAddressOf());
+    if (FAILED(resource.As(&texture))) return;
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    const UINT mip = binding.Texture2D.MipSlice;
+    desc.Width = std::max(1u, desc.Width >> mip);
+    desc.Height = std::max(1u, desc.Height >> mip);
+    if (desc.SampleDesc.Count != 1 || viewport.Width != desc.Width || viewport.Height != desc.Height ||
+        viewport.TopLeftX != 0 || viewport.TopLeftY != 0) return;
+    DXGI_FORMAT readFormat;
+    switch (binding.Format) {
+    case DXGI_FORMAT_D16_UNORM:
+        desc.Format = DXGI_FORMAT_R16_TYPELESS; readFormat = DXGI_FORMAT_R16_UNORM; break;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        desc.Format = DXGI_FORMAT_R24G8_TYPELESS; readFormat = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+    case DXGI_FORMAT_D32_FLOAT:
+        desc.Format = DXGI_FORMAT_R32_TYPELESS; readFormat = DXGI_FORMAT_R32_FLOAT; break;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS; readFormat = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; break;
+    default: return;
+    }
+    if (!depth.snapshot || desc.Width != depth.desc.Width || desc.Height != depth.desc.Height ||
+        desc.Format != depth.desc.Format) {
+        desc.MipLevels = desc.ArraySize = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+        desc.CPUAccessFlags = desc.MiscFlags = 0;
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = readFormat;
+        srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = 1;
+        ComPtr<ID3D11Texture2D> snapshot;
+        ComPtr<ID3D11ShaderResourceView> reader;
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, snapshot.GetAddressOf())) ||
+            FAILED(device->CreateShaderResourceView(snapshot.Get(), &srv, reader.GetAddressOf()))) return;
+        depth.snapshot = std::move(snapshot);
+        depth.view = std::move(reader);
+        depth.desc = desc;
+    }
+    depth.source = std::move(texture);
+    depth.sourceView = view;
+    depth.viewport = viewport;
+    depth.subresource = mip;
+    depth.reversed = mode.DepthFunc == D3D11_COMPARISON_GREATER || mode.DepthFunc == D3D11_COMPARISON_GREATER_EQUAL;
+    depth.frozen = false;
+    depth.frame = renderFrame;
+}
+
 bool InspectDraw(Context* c, const Draw& draw) {
     if (!hooksReady || drawingExtra) return false;
     const auto now = GetTickCount64();
@@ -1111,6 +1233,7 @@ bool InspectDraw(Context* c, const Draw& draw) {
     if (capture && sceneColor) CaptureMask(c, state, device.Get(), res, draw, key);
     if (!PrepareGhost(device.Get(), res)) return false;
     if (active && selected && sceneColor) {
+        RememberSceneDepth(device.Get(), res.sceneDepth, state.depthView, state.depthState, state.viewport);
         const bool recording = now < previewUntil || effectFrame.trailFrames || airCombo.descentCapture;
         CapturePlayer(c, state, device.Get(), res, draw, key, nowUs, recording, stompRenderFrame == renderFrame);
     } else if (active && gear && sceneColor && body > 0 && res.playerFront.frame == renderFrame) {
@@ -1130,9 +1253,9 @@ bool InspectDraw(Context* c, const Draw& draw) {
         const auto surface = activeCostume == Costume::Black ? ClassifyGhostMaterial(key) : mesh->material;
         const bool gripAtlas = surface == GhostMaterial::GripAtlas;
         const float skinBoost = 0.46f * settings.muscleHighlight / 100.0f;
-        const float materialBrightness = settings.glassVisual ? settings.brightness / 100.0f * 0.48f : 1.0f;
-        const float intensity = settings.alpha * (1.0f + settings.glowStrength / 100.0f) * (1 - body) / 25500.0f *
-            materialBrightness;
+        const float glow = settings.glowStrength / 100.0f;
+        const float lighting = settings.glassVisual ? (settings.brightness / 100.0f + glow) * 0.48f : 1.0f + glow;
+        const float intensity = settings.alpha * lighting * (1 - body) / 25500.0f;
         auto setPS = Original<SetPS>(c, PsShader);
         auto drawUnderlay = [&](ID3D11PixelShader* shader, float level) {
             const FLOAT blue[]{settings.tint[0] * intensity * level * 0.70f,
@@ -1347,10 +1470,11 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
                 return float4(glass * (1 - alpha) + light, 1);
             })";
         ComPtr<ID3DBlob> code;
-        constexpr char partLighting[] = R"(
+        const std::string partLighting = std::string(SceneOcclusion) + R"(
             cbuffer Part : register(b11) { float id; float minimum; float range; }
             cbuffer Viewport : register(b12) { float invHeight; }
             float4 surface(float4 pos, float label, float low, float span) {
+                occlude(pos);
                 float z = rcp(max(abs(pos.w), 0.0001));
                 float3 normal = normalize(float3(-ddx(z), ddy(z), z * invHeight * 1.1));
                 float diffuse = pow(saturate(dot(normal, float3(-0.42, 0.44, 0.794))), 1.35);
@@ -1538,6 +1662,8 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
     } extra;
     auto* c = res.overlayContext.Get();
     auto& refraction = res.refraction;
+    const auto& sceneDepth = res.sceneDepth;
+    const bool hasSceneDepth = sceneDepth.frame == renderFrame && sceneDepth.view;
     const bool playerFront = res.playerFront.frame == renderFrame && res.playerFront.count;
     bool useRefraction = desc.SampleDesc.Count == 1 && !refraction.unavailable && layerCount <= MaxGhostLayers;
     if (useRefraction && !PrepareRefraction(device, refraction, desc, layerCount + unsigned(playerFront))) {
@@ -1548,10 +1674,12 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
     }
     // Keep a visible character untouched even if this backbuffer cannot build the front mask.
     if (playerFront && !useRefraction) return false;
+    if (hasSceneDepth && !sceneDepth.frozen) CopySceneDepth(c, sceneDepth);
     auto* rtv = target.Get();
     if (useRefraction) c->CopyResource(refraction.scene.Get(), backBuffer.Get());
     auto* stencil = res.overlayCoverage.Get();
-    const D3D11_VIEWPORT viewport{0, 0, float(desc.Width), float(desc.Height), 0, 1};
+    const D3D11_VIEWPORT viewport{0, 0, float(desc.Width), float(desc.Height),
+        hasSceneDepth ? sceneDepth.viewport.MinDepth : 0, hasSceneDepth ? sceneDepth.viewport.MaxDepth : 1};
     if (!useRefraction) Original<SetTargets>(c, Targets)(c, 1, &rtv, stencil);
     Original<SetDepth>(c, Depth)(c, useRefraction ? refraction.partDepth.Get() : res.overlayStencil.Get(), 0);
     Original<SetViewport>(c, Viewports)(c, 1, &viewport);
@@ -1559,6 +1687,13 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
     Original<SetBlend>(c, Blend)(c, useRefraction ? nullptr : res.ghostBlend.Get(), nullptr, UINT_MAX);
     auto* lighting = res.ghostLighting.Get();
     Original<SetBuffers>(c, PsConstants)(c, ColorSlot - 1, 1, &lighting);
+    const FLOAT depthParameters[]{float(sceneDepth.desc.Width) / desc.Width, float(sceneDepth.desc.Height) / desc.Height,
+        hasSceneDepth ? (sceneDepth.reversed ? -1.0f : 1.0f) : 0.0f, 0.00005f};
+    auto* depthConstants = res.sceneDepthConstants.Get();
+    c->UpdateSubresource(depthConstants, 0, nullptr, depthParameters, 0, 0);
+    Original<SetBuffers>(c, PsConstants)(c, ColorSlot - 3, 1, &depthConstants);
+    auto* depthTexture = hasSceneDepth ? sceneDepth.view.Get() : nullptr;
+    c->PSSetShaderResources(2, 1, &depthTexture);
     if (useRefraction) {
         const FLOAT projection[4]{1.0f / desc.Height};
         c->UpdateSubresource(lighting, 0, nullptr, projection, 0, 0);
@@ -1601,7 +1736,9 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
             lastPartLabel = labelIndex;
         }
         if (!useRefraction && packet.opacity != lastOpacity) {
-            const FLOAT constants[4]{packet.opacity, 1.0f + settings.glowStrength / 100.0f};
+            const float glow = settings.glowStrength / 100.0f;
+            const FLOAT constants[4]{packet.opacity,
+                settings.glassVisual ? settings.brightness / 100.0f + glow : 1.0f + glow};
             c->UpdateSubresource(lighting, 0, nullptr, constants, 0, 0);
             lastOpacity = packet.opacity;
         }
@@ -1629,12 +1766,13 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
     if (FAILED(Original<FinishList>(c, Finish)(c, FALSE, list.GetAddressOf())) || !list) return false;
     Original<ExecuteList>(immediate.Get(), Execute)(immediate.Get(), list.Get(), TRUE);
     if (loggedOverlays++ < 16)
-        Log("OVERLAY_DRAW frame=%llu draws=%u poses=%u backbuffer=%ux%u emission=%u refraction=%u segmented=%u player_front=%u style=%s",
+        Log("OVERLAY_DRAW frame=%llu draws=%u poses=%u backbuffer=%ux%u brightness=%u emission=%u refraction=%u segmented=%u player_front=%u style=%s scene_depth=%ux%u frozen=%u",
             static_cast<unsigned long long>(renderFrame), static_cast<unsigned>(draws.size()), poses, desc.Width,
-            desc.Height, settings.glowStrength,
+            desc.Height, settings.brightness, settings.glowStrength,
             useRefraction ? (settings.glassVisual ? settings.glassRefraction : settings.refractionPixels) : 0,
             unsigned(useRefraction), playerFront ? res.playerFront.count : 0,
-            settings.glassVisual ? "Sigma2" : "Classic");
+            settings.glassVisual ? "Sigma2" : "Classic", hasSceneDepth ? sceneDepth.desc.Width : 0,
+            hasSceneDepth ? sceneDepth.desc.Height : 0, hasSceneDepth && sceneDepth.frozen);
     return true;
 }
 
@@ -1667,6 +1805,7 @@ const Hook hooks[]{
     {PsShader, reinterpret_cast<void*>(TrackPS)}, {VsShader, reinterpret_cast<void*>(TrackVS)},
     {Targets, reinterpret_cast<void*>(TrackTargets)}, {TargetsAndUavs, reinterpret_cast<void*>(TrackTargetsUav)},
     {Blend, reinterpret_cast<void*>(TrackBlend)}, {Depth, reinterpret_cast<void*>(TrackDepth)},
+    {ClearDepthView, reinterpret_cast<void*>(ObserveClearDepth)},
     {Viewports, reinterpret_cast<void*>(TrackViewport)}, {Clear, reinterpret_cast<void*>(TrackClear)},
     {Indexed, reinterpret_cast<void*>(ObserveIndexed)}, {IndexedInstanced, reinterpret_cast<void*>(ObserveIndexedInstanced)},
     {Finish, reinterpret_cast<void*>(ObserveFinish)}, {Execute, reinterpret_cast<void*>(ObserveExecute)}
@@ -1831,7 +1970,8 @@ void ReadSettings() {
                 const auto value = static_cast<int>(GetPrivateProfileIntW(section, key, fallback, ini.c_str()));
                 return static_cast<unsigned>(std::clamp(value, 0, static_cast<int>(maximum)));
             };
-            return {read(L"OpacityPercent", 40, 100), read(L"GlowStrengthPercent", 68, 100),
+            return {read(L"OpacityPercent", 40, 100),
+                read(L"GlowStrengthPercent", 68, settings.glassVisual ? MaxSigma2GlowStrength : 100),
                 {read(L"TintR", 144, 255), read(L"TintG", 163, 255), read(L"TintB", 253, 255)},
                 exposedSkin ? read(L"MuscleHighlightPercent", 45, 100) : 0,
                 read(L"SurfaceBrightnessPercent", 100, MaxSurfaceBrightness)};
@@ -1938,7 +2078,7 @@ bool StartAfterimage(const wchar_t* root, GameCompatibility::Kind kind, Controll
     logFile = _wfsopen((directory + L"\\NGS1Afterimage.log").c_str(), L"wb", _SH_DENYNO);
     gameBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     controllerHooks = shared;
-    Log("GAME pid=%lu build=%s afterimage=0.6.8", GetCurrentProcessId(), GameCompatibility::Name(kind));
+    Log("GAME pid=%lu build=%s afterimage=0.6.9", GetCurrentProcessId(), GameCompatibility::Name(kind));
     if (GetModuleHandleW(L"NGS1Afterimage.dll")) {
         Log("LEGACY_AFTERIMAGE_ALREADY_LOADED");
         return false;
