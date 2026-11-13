@@ -15,17 +15,17 @@ static class InstallerSession {
  public static bool Initialize(ref string[] args){
   string self=Assembly.GetExecutingAssembly().Location;
   if(args.Length>=4&&args[0]=="--session-parent"&&args[2]=="--session-source"){
-   int parent;if(!Int32.TryParse(args[1],out parent))throw new Exception("临时安装会话参数无效。");
-   try{using(var process=Process.GetProcessById(parent))if(!process.WaitForExit(15000))throw new Exception("旧安装窗口尚未退出，未清理运行目录。");}catch(ArgumentException){}
+   int parent;if(!Int32.TryParse(args[1],out parent))throw new Exception(InstallerLanguage.T("临时安装会话参数无效。", "Invalid temporary installer session arguments."));
+   try{using(var process=Process.GetProcessById(parent))if(!process.WaitForExit(15000))throw new Exception(InstallerLanguage.T("旧安装窗口尚未退出，未清理运行目录。", "The previous installer window is still open. The runtime folder was left intact."));}catch(ArgumentException){}
    string source=Path.GetFullPath(args[3]),folder=Path.GetDirectoryName(source),root=Path.GetDirectoryName(folder);
    if(!String.Equals(Path.GetFileName(folder),LaunchEngine.Folder,StringComparison.OrdinalIgnoreCase)||!File.Exists(Path.Combine(root,Payload.ExeName))||!File.Exists(Path.Combine(folder,"launch-state.json"))||
-      (File.GetAttributes(folder)&FileAttributes.ReparsePoint)!=0||(File.Exists(source)&&((File.GetAttributes(source)&FileAttributes.ReparsePoint)!=0||Payload.FileHash(source)!=Payload.FileHash(self))))throw new Exception("临时安装会话归属检查失败，未删除文件。");
+      (File.GetAttributes(folder)&FileAttributes.ReparsePoint)!=0||(File.Exists(source)&&((File.GetAttributes(source)&FileAttributes.ReparsePoint)!=0||Payload.FileHash(source)!=Payload.FileHash(self))))throw new Exception(InstallerLanguage.T("临时安装会话归属检查失败，未删除文件。", "Could not verify the temporary installer session. No files were removed."));
    if(File.Exists(source))File.Delete(source);args=args.Skip(4).ToArray();ScheduleTemporaryRemoval(self);return false;
   }
   string directory=Path.GetDirectoryName(self),gameRoot=Path.GetDirectoryName(directory);
   if(!String.Equals(Path.GetFileName(directory),LaunchEngine.Folder,StringComparison.OrdinalIgnoreCase)||!File.Exists(Path.Combine(gameRoot,Payload.ExeName)))return false;
   string tempRoot=Path.GetFullPath(Path.GetTempPath()),copy=Path.Combine(tempRoot,"NGS1RumbleInstaller_"+Guid.NewGuid().ToString("N")+".exe");
-  if(!Path.GetFullPath(copy).StartsWith(tempRoot.TrimEnd(Path.DirectorySeparatorChar)+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase))throw new Exception("临时安装路径越界。");
+  if(!Path.GetFullPath(copy).StartsWith(tempRoot.TrimEnd(Path.DirectorySeparatorChar)+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase))throw new Exception(InstallerLanguage.T("临时安装路径越界。", "The temporary installer path is outside the permitted folder."));
   File.Copy(self,copy,false);
   string[] forward=args.Length==0?new[]{"--ui",gameRoot}:args;
   var parameters=new[]{"--session-parent",Process.GetCurrentProcess().Id.ToString(),"--session-source",self}.Concat(forward);
@@ -33,7 +33,7 @@ static class InstallerSession {
  }
  static void ScheduleTemporaryRemoval(string self){
   string temp=Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar)+Path.DirectorySeparatorChar;
-  if(!Path.GetFullPath(self).StartsWith(temp,StringComparison.OrdinalIgnoreCase)||!Regex.IsMatch(Path.GetFileName(self),@"^NGS1RumbleInstaller_[0-9a-f]{32}\.exe$",RegexOptions.IgnoreCase))throw new Exception("临时安装会话路径异常。");
+  if(!Path.GetFullPath(self).StartsWith(temp,StringComparison.OrdinalIgnoreCase)||!Regex.IsMatch(Path.GetFileName(self),@"^NGS1RumbleInstaller_[0-9a-f]{32}\.exe$",RegexOptions.IgnoreCase))throw new Exception(InstallerLanguage.T("临时安装会话路径异常。", "Invalid temporary installer session path."));
   string pathData=Convert.ToBase64String(Encoding.UTF8.GetBytes(self)),prefixData=Convert.ToBase64String(Encoding.UTF8.GetBytes(temp));
   // Use framework APIs only. A parent PowerShell 7 environment may otherwise
   // make Windows PowerShell's module autoloading pick incompatible cmdlets.

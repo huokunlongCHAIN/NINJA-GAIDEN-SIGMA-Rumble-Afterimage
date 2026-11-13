@@ -27,7 +27,7 @@ public sealed class PatchFacade {
    try{
     LaunchEngine.ValidateRoot(result.Root);
     result.CanInstall=true;
-    result.Description=compatibility.Reason+(runtime?" 运行库已准备，可安装或更新功能。":" 安装后直接打开游戏 EXE 即可加载。");
+    result.Description=compatibility.Reason+(runtime?InstallerLanguage.T(" 运行库已准备，可安装或更新功能。", " The runtime is ready for feature installation or updates."):InstallerLanguage.T(" 安装后直接打开游戏 EXE 即可加载。", " After installing, open the game EXE to load the patch."));
    }catch(Exception e){result.CanInstall=false;result.Description=e.Message;}
   }
   return result;
@@ -49,23 +49,23 @@ public static class LaunchEngine {
  public const string Folder="NGS1RumbleRuntime",Shortcut="NINJA GAIDEN SIGMA - 震动版.lnk";
  static readonly JavaScriptSerializer json=new JavaScriptSerializer();
  sealed class Guard:IDisposable {
-  readonly Mutex mutex;public Guard(string root,string kind){mutex=new Mutex(false,"Local\\NGS1Rumble-"+kind+"-"+Payload.Hash(Encoding.UTF8.GetBytes(root.ToUpperInvariant())).Substring(0,24));bool acquired;try{acquired=mutex.WaitOne(0);}catch(AbandonedMutexException){acquired=true;}if(!acquired){mutex.Dispose();throw new Exception("此目录已有另一个兼容启动操作，请等待完成。");}}
+  readonly Mutex mutex;public Guard(string root,string kind){mutex=new Mutex(false,"Local\\NGS1Rumble-"+kind+"-"+Payload.Hash(Encoding.UTF8.GetBytes(root.ToUpperInvariant())).Substring(0,24));bool acquired;try{acquired=mutex.WaitOne(0);}catch(AbandonedMutexException){acquired=true;}if(!acquired){mutex.Dispose();throw new Exception(InstallerLanguage.T("此目录已有另一个兼容启动操作，请等待完成。", "Another compatibility operation is using this folder. Wait for it to finish."));}}
   public void Dispose(){mutex.ReleaseMutex();mutex.Dispose();}
  }
  static string Runtime(string root){return Path.Combine(root,Folder);}
  static string Marker(string root){return Path.Combine(Runtime(root),"launch-state.json");}
  static string Launcher(string root){return Path.Combine(Runtime(root),"NGS1RumblePatch.exe");}
  static string Command(string root){return "--launch \""+root+"\"";}
- static void NoLink(string path){if((File.Exists(path)||Directory.Exists(path))&&(File.GetAttributes(path)&FileAttributes.ReparsePoint)!=0)throw new Exception("兼容启动路径包含链接，未写入："+path);}
+ static void NoLink(string path){if((File.Exists(path)||Directory.Exists(path))&&(File.GetAttributes(path)&FileAttributes.ReparsePoint)!=0)throw new Exception(InstallerLanguage.T("兼容启动路径包含链接，未写入：", "The runtime path contains a link. No files were written at: ")+path);}
  static bool ValidHash(string value){return value!=null&&value.Length==64&&value.All(Uri.IsHexDigit);}
  static LaunchState Read(string root){
   NoLink(Runtime(root));NoLink(Marker(root));if(!Directory.Exists(Runtime(root)))return null;
-  if(!File.Exists(Marker(root))||new FileInfo(Marker(root)).Length>16384)throw new Exception("兼容运行目录已存在但缺少有效记录，未覆盖："+Runtime(root));
+  if(!File.Exists(Marker(root))||new FileInfo(Marker(root)).Length>16384)throw new Exception(InstallerLanguage.T("兼容运行目录已存在但缺少有效记录，未覆盖：", "The runtime folder already exists without a valid record. It was left intact: ")+Runtime(root));
   LaunchState state;
-  try{state=json.Deserialize<LaunchState>(File.ReadAllText(Marker(root),Encoding.UTF8));}catch{throw new Exception("兼容启动记录损坏，请保留目录。 ");}
+  try{state=json.Deserialize<LaunchState>(File.ReadAllText(Marker(root),Encoding.UTF8));}catch{throw new Exception(InstallerLanguage.T("兼容启动记录损坏，请保留目录。 ", "The runtime record is corrupt. Keep the folder for recovery."));}
   if(state==null||state.Schema!=1||state.Product!="NGS1RumbleLauncher"||!String.Equals(state.GameRoot,root,StringComparison.OrdinalIgnoreCase)||
-   !new[]{"Preparing","Installed","Restored"}.Contains(state.Phase)||!ValidHash(state.LauncherHash))throw new Exception("兼容启动记录异常，未写入。");
-  if((state.AutoLoaderHash!=null&&!ValidHash(state.AutoLoaderHash))||(state.PreviousAutoLoaderHash!=null&&!ValidHash(state.PreviousAutoLoaderHash)))throw new Exception("自动加载器记录校验异常。");
+   !new[]{"Preparing","Installed","Restored"}.Contains(state.Phase)||!ValidHash(state.LauncherHash))throw new Exception(InstallerLanguage.T("兼容启动记录异常，未写入。", "The runtime record is invalid. No files were written."));
+  if((state.AutoLoaderHash!=null&&!ValidHash(state.AutoLoaderHash))||(state.PreviousAutoLoaderHash!=null&&!ValidHash(state.PreviousAutoLoaderHash)))throw new Exception(InstallerLanguage.T("自动加载器记录校验异常。", "The autoloader record contains an invalid checksum."));
   NoLink(Launcher(root));NoLink(AutoLifecycle.Executable(root));return state;
  }
  static void Save(string root,LaunchState state){
@@ -76,9 +76,9 @@ public static class LaunchEngine {
  public static void StartInstalledWatcher(string root){var state=Read(root);if(state!=null&&state.Phase=="Installed"&&state.AutoLoaderHash!=null)AutoLifecycle.Start(root,state.AutoLoaderHash);}
  public static void ValidateRoot(string root){
   GameCompatibility.Validate(Path.Combine(root,Payload.ExeName));NoLink(Runtime(root));NoLink(Path.Combine(root,Shortcut));
-  if(File.Exists(Path.Combine(root,"dinput8.dll")))throw new Exception("此原版目录已有 dinput8.dll。请先还原旧补丁或处理现有插件，再安装兼容启动器。");
+  if(File.Exists(Path.Combine(root,"dinput8.dll")))throw new Exception(InstallerLanguage.T("此原版目录已有 dinput8.dll。请先还原旧补丁或处理现有插件，再安装兼容启动器。", "This game folder already contains dinput8.dll. Restore the previous patch or resolve the plugin conflict before installing the compatibility runtime."));
   var state=Read(root);
-  if(state!=null&&File.Exists(Launcher(root))&&Payload.FileHash(Launcher(root))!=state.LauncherHash&&Payload.FileHash(Launcher(root))!=Payload.FileHash(Assembly.GetExecutingAssembly().Location))throw new Exception("旧版启动程序被其它文件替换，未覆盖。");
+  if(state!=null&&File.Exists(Launcher(root))&&Payload.FileHash(Launcher(root))!=state.LauncherHash&&Payload.FileHash(Launcher(root))!=Payload.FileHash(Assembly.GetExecutingAssembly().Location))throw new Exception(InstallerLanguage.T("旧版启动程序被其它文件替换，未覆盖。", "The old launcher was replaced by another file. It was left intact."));
  }
  static object ShortcutObject(string path){var type=Type.GetTypeFromProgID("WScript.Shell");object shell=Activator.CreateInstance(type);try{return type.InvokeMember("CreateShortcut",BindingFlags.InvokeMethod,null,shell,new object[]{path});}finally{Marshal.FinalReleaseComObject(shell);}}
  static object Get(object value,string property){return value.GetType().InvokeMember(property,BindingFlags.GetProperty,null,value,null);}
@@ -89,7 +89,7 @@ public static class LaunchEngine {
  static void RemoveLegacyShortcut(string root){string path=Path.Combine(root,Shortcut);NoLink(path);if(File.Exists(path)&&ShortcutOwned(root))File.Delete(path);}
  static Process Game(string root){
   Process found=null;foreach(var p in Process.GetProcessesByName("NINJA GAIDEN SIGMA")){
-   try{if(String.Equals(p.MainModule.FileName,Path.Combine(root,Payload.ExeName),StringComparison.OrdinalIgnoreCase)){if(found!=null){p.Dispose();found.Dispose();throw new Exception("同一目录运行了多个游戏进程，请只保留一个。");}found=p;continue;}}
+   try{if(String.Equals(p.MainModule.FileName,Path.Combine(root,Payload.ExeName),StringComparison.OrdinalIgnoreCase)){if(found!=null){p.Dispose();found.Dispose();throw new Exception(InstallerLanguage.T("同一目录运行了多个游戏进程，请只保留一个。", "Multiple game processes are running from this folder. Close the extra instances."));}found=p;continue;}}
    catch(InvalidOperationException){}catch(System.ComponentModel.Win32Exception){}p.Dispose();
   }return found;
  }
@@ -98,7 +98,7 @@ public static class LaunchEngine {
    return view.ReadUInt32(0)==0x4d52474e&&view.ReadUInt32(4)==1&&view.ReadUInt32(8)==648&&view.ReadUInt32(16)==pid&&view.ReadUInt32(20)==1;
   }}catch(FileNotFoundException){return false;}
  }
- static void RuntimeStopped(string root){using(var game=Game(root)){if(game==null)return;foreach(ProcessModule module in game.Modules)if(String.Equals(module.FileName,Path.Combine(Runtime(root),"dinput8.dll"),StringComparison.OrdinalIgnoreCase))throw new Exception("请正常退出这个目录的游戏，再更新或还原兼容运行库。");}}
+ static void RuntimeStopped(string root){using(var game=Game(root)){if(game==null)return;foreach(ProcessModule module in game.Modules)if(String.Equals(module.FileName,Path.Combine(Runtime(root),"dinput8.dll"),StringComparison.OrdinalIgnoreCase))throw new Exception(InstallerLanguage.T("请正常退出这个目录的游戏，再更新或还原兼容运行库。", "Exit the game in this folder before updating or restoring the compatibility runtime."));}}
  public static string Install(string input,bool enableAuto=true,System.Collections.Generic.List<PatchFile> selectedPayload=null){
   string root=PatchEngine.Root(input);using(var guard=new Guard(root,"operation"))return InstallRoot(root,enableAuto,selectedPayload);
  }
@@ -115,18 +115,20 @@ public static class LaunchEngine {
   if(File.Exists(Launcher(root)))File.Delete(Launcher(root));
   state.LauncherHash=hash;state.Version=Payload.Version;state.PreviousAutoLoaderHash=null;state.Phase="Installed";state.AutoEnabled=persistent;Save(root,state);
   if(persistent)AutoLifecycle.Enable(root);
-  return "兼容运行库已安装。"+(persistent?" 已启用当前 Windows 用户的自动加载。":" 诊断准备模式，自动加载尚未启用。")+(runtimeResult.Contains("自定义参数已另存")?"\r\n"+runtimeResult:"");
+  return InstallerLanguage.T("兼容运行库已安装。", "The compatibility runtime is installed.")+(persistent?InstallerLanguage.T(" 已启用当前 Windows 用户的自动加载。", " Automatic loading is enabled for this Windows user."):InstallerLanguage.T(" 诊断准备模式，自动加载尚未启用。", " Diagnostic preparation mode. Automatic loading is disabled."))+(runtimeResult.Contains(InstallerLanguage.T("自定义参数已另存", "Custom settings were backed up"))?"\r\n"+runtimeResult:"");
  }
  public static string Restore(string input){
   string root=PatchEngine.Root(input);using(var guard=new Guard(root,"operation"))return RestoreRoot(root);
  }
  static string RestoreRoot(string root){
-  var state=Read(root);if(state==null)return "兼容模式无需还原。";RuntimeStopped(root);
+  var state=Read(root);if(state==null)return InstallerLanguage.T("兼容模式无需还原。", "There is no compatibility runtime to restore.");RuntimeStopped(root);
   CleanUninstall.ValidateRuntime(root,state.LauncherHash,state.AutoLoaderHash,state.PreviousAutoLoaderHash);AutoLifecycle.Stop(root);AutoLifecycle.Disable(root);state.AutoEnabled=false;Save(root,state);
   var engine=new PatchEngine(root);engine.Restore(Runtime(root));
   RemoveLegacyShortcut(root);state.Phase="Restored";Save(root,state);
   CleanUninstall.DeleteRuntime(root,state.LauncherHash,state.AutoLoaderHash,state.PreviousAutoLoaderHash);
-  return "兼容模式已完整还原：自动加载器已停止，登录启动项已移除，运行库、备份、日志、旧快捷方式及 "+Folder+" 文件夹均已清理。";
+  return String.Format(InstallerLanguage.T(
+   "兼容模式已完整还原。自动加载器已停止，登录启动项、旧快捷方式和 {0} 文件夹已移除。",
+   "Compatibility mode was restored. The autoloader was stopped and its startup entry, old shortcut, and {0} folder were removed."),Folder);
  }
  public static int Start(string input){
   string root=PatchEngine.Root(input);using(var guard=new Guard(root,"operation"))return StartRoot(root);
@@ -138,36 +140,36 @@ public static class LaunchEngine {
   // Localized native mode can launch directly; it already loads the same bridge.
   bool native=File.Exists(Path.Combine(root,"dinput8.dll"))&&Payload.KnownCores.Contains(Payload.FileHash(Path.Combine(root,"dinput8.dll")));
   if(!native){var state=Read(root);if(state==null||state.Phase!="Installed"||state.AutoLoaderHash!=PayloadHashes.Values[AutoLifecycle.FileName])Install(root);else{
-   ValidateRoot(root);var inspection=new PatchEngine(root).Inspect(Runtime(root));if(!inspection.CanRestore)throw new Exception("兼容运行库没有有效安装记录，请先安装。");
-   string core=Path.Combine(Runtime(root),"dinput8.dll");if(!File.Exists(core)||Payload.FileHash(core)!=PayloadHashes.Values["dinput8.dll"])throw new Exception("兼容运行库缺失或版本已改变，请退出游戏后安装／更新。");
+   ValidateRoot(root);var inspection=new PatchEngine(root).Inspect(Runtime(root));if(!inspection.CanRestore)throw new Exception(InstallerLanguage.T("兼容运行库没有有效安装记录，请先安装。", "The compatibility runtime has no valid installation record. Install the patch first."));
+   string core=Path.Combine(Runtime(root),"dinput8.dll");if(!File.Exists(core)||Payload.FileHash(core)!=PayloadHashes.Values["dinput8.dll"])throw new Exception(InstallerLanguage.T("兼容运行库缺失或版本已改变，请退出游戏后安装／更新。", "The compatibility runtime is missing or the version changed. Exit the game, then install or update the patch."));
    AutoLifecycle.Enable(root);state.AutoEnabled=true;Save(root,state);
   }}
    if(process!=null&&Ready(process.Id))return process.Id;
    if(process==null)process=Process.Start(new ProcessStartInfo{FileName=Path.Combine(root,Payload.ExeName),WorkingDirectory=root,UseShellExecute=true});
    int pid=process.Id;try{process.WaitForInputIdle(10000);}catch(InvalidOperationException){}
-   var timer=Stopwatch.StartNew();while(timer.ElapsedMilliseconds<8000){if(process.HasExited)throw new Exception("游戏在加载震动前已退出。");if(Ready(pid))return pid;Thread.Sleep(100);}
+   var timer=Stopwatch.StartNew();while(timer.ElapsedMilliseconds<8000){if(process.HasExited)throw new Exception(InstallerLanguage.T("游戏在加载震动前已退出。", "The game exited before loading the patch."));if(Ready(pid))return pid;Thread.Sleep(100);}
    // Original mode is injected by the persistent autoloader, including when the
    // installer is closed and the user opens the game EXE on a later run.
-   timer.Restart();while(timer.ElapsedMilliseconds<10000){if(process.HasExited)throw new Exception("游戏启动后退出，请查看 NGS1Rumble 诊断日志。");if(Ready(pid))return pid;Thread.Sleep(50);}
-   throw new Exception("震动核心尚未就绪，请查看诊断日志；未重复注入。");
+   timer.Restart();while(timer.ElapsedMilliseconds<10000){if(process.HasExited)throw new Exception(InstallerLanguage.T("游戏启动后退出，请查看 NGS1Rumble 诊断日志。", "The game exited during startup. Check the NGS1Rumble diagnostic logs."));if(Ready(pid))return pid;Thread.Sleep(50);}
+   throw new Exception(InstallerLanguage.T("震动核心尚未就绪，请查看诊断日志；未重复注入。", "The patch runtime is not ready. Check the diagnostic logs. The installer did not retry loading it."));
   }finally{if(process!=null)process.Dispose();}
  }
  static void Inject(Process process,string path){
   if(process.Modules.Cast<ProcessModule>().Any(m=>String.Equals(m.FileName,path,StringComparison.OrdinalIgnoreCase)))return;
   IntPtr local=GetProcAddress(GetModuleHandle("kernel32.dll"),"LoadLibraryW"),owner;
-  if(local==IntPtr.Zero||!GetModuleHandleEx(6,local,out owner))throw new Exception("无法定位系统加载器。");
+  if(local==IntPtr.Zero||!GetModuleHandleEx(6,local,out owner))throw new Exception(InstallerLanguage.T("无法定位系统加载器。", "Could not locate the Windows loader."));
   var filename=new StringBuilder(32768);GetModuleFileName(owner,filename,filename.Capacity);string name=Path.GetFileName(filename.ToString());
   ProcessModule remote=process.Modules.Cast<ProcessModule>().SingleOrDefault(m=>String.Equals(Path.GetFileName(m.FileName),name,StringComparison.OrdinalIgnoreCase));
-  if(remote==null)throw new Exception("目标进程缺少匹配的系统加载器。");
+  if(remote==null)throw new Exception(InstallerLanguage.T("目标进程缺少匹配的系统加载器。", "The game process has no matching Windows loader."));
   IntPtr entry=new IntPtr(remote.BaseAddress.ToInt64()+local.ToInt64()-owner.ToInt64());byte[] bytes=Encoding.Unicode.GetBytes(path+"\0");
   IntPtr handle=OpenProcess(0x43a,false,process.Id),buffer=IntPtr.Zero,thread=IntPtr.Zero;bool finished=false;
-  if(handle==IntPtr.Zero)throw new Exception("无法访问游戏进程，错误 "+Marshal.GetLastWin32Error());
+  if(handle==IntPtr.Zero)throw new Exception(InstallerLanguage.T("无法访问游戏进程，错误 ", "Could not access the game process. Windows error ")+Marshal.GetLastWin32Error());
   try{
    buffer=VirtualAllocEx(handle,IntPtr.Zero,(UIntPtr)bytes.Length,0x3000,4);UIntPtr written;
-   if(buffer==IntPtr.Zero||!WriteProcessMemory(handle,buffer,bytes,(UIntPtr)bytes.Length,out written)||written.ToUInt64()!=(ulong)bytes.Length)throw new Exception("无法传递运行库路径，错误 "+Marshal.GetLastWin32Error());
-   thread=CreateRemoteThread(handle,IntPtr.Zero,UIntPtr.Zero,entry,buffer,0,IntPtr.Zero);if(thread==IntPtr.Zero)throw new Exception("无法加载震动运行库，错误 "+Marshal.GetLastWin32Error());
-   finished=WaitForSingleObject(thread,10000)==0;if(!finished)throw new Exception("运行库加载超时，未重试；请退出游戏后重开。");
-   process.Refresh();if(!process.Modules.Cast<ProcessModule>().Any(m=>String.Equals(m.FileName,path,StringComparison.OrdinalIgnoreCase)))throw new Exception("系统未能加载震动运行库。");
+   if(buffer==IntPtr.Zero||!WriteProcessMemory(handle,buffer,bytes,(UIntPtr)bytes.Length,out written)||written.ToUInt64()!=(ulong)bytes.Length)throw new Exception(InstallerLanguage.T("无法传递运行库路径，错误 ", "Could not send the runtime path. Windows error ")+Marshal.GetLastWin32Error());
+   thread=CreateRemoteThread(handle,IntPtr.Zero,UIntPtr.Zero,entry,buffer,0,IntPtr.Zero);if(thread==IntPtr.Zero)throw new Exception(InstallerLanguage.T("无法加载震动运行库，错误 ", "Could not load the patch runtime. Windows error ")+Marshal.GetLastWin32Error());
+   finished=WaitForSingleObject(thread,10000)==0;if(!finished)throw new Exception(InstallerLanguage.T("运行库加载超时，未重试；请退出游戏后重开。", "The patch runtime timed out. Exit and reopen the game to try again."));
+   process.Refresh();if(!process.Modules.Cast<ProcessModule>().Any(m=>String.Equals(m.FileName,path,StringComparison.OrdinalIgnoreCase)))throw new Exception(InstallerLanguage.T("系统未能加载震动运行库。", "Windows could not load the patch runtime."));
   }finally{if(thread!=IntPtr.Zero)CloseHandle(thread);if(buffer!=IntPtr.Zero&&(thread==IntPtr.Zero||finished))VirtualFreeEx(handle,buffer,UIntPtr.Zero,0x8000);CloseHandle(handle);}
  }
  [DllImport("kernel32.dll",SetLastError=true)]static extern IntPtr OpenProcess(uint access,bool inherit,int pid);

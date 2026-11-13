@@ -9,7 +9,7 @@ public sealed class PatchFile {
  public string Name,Hash;public byte[] Bytes;
 }
 public static class Payload {
- public const string Version="0.6.3";
+ public const string Version="0.6.4";
  public const string Core="0.7.3";
  public const string ExeName="NINJA GAIDEN SIGMA.exe";
  public const string ExeHash="15B7778118F8B1D0E0EE98A4DFF03DA9F99A3ABA4C7B3BF4F2CA157674B614C7";
@@ -29,16 +29,16 @@ public static class Payload {
   var result=new List<PatchFile>();var assembly=Assembly.GetExecutingAssembly();
   var expected=PayloadHashes.Values;
   foreach(string name in Names)using(var input=assembly.GetManifestResourceStream("Payload."+name)){
-   if(input==null)throw new Exception("安装包缺少内置文件："+name);
+   if(input==null)throw new Exception(InstallerLanguage.T("安装包缺少内置文件：", "The installer is missing an embedded file: ")+name);
    using(var buffer=new MemoryStream()){input.CopyTo(buffer);var bytes=buffer.ToArray();string hash=Hash(bytes);
-    if(hash!=expected[name])throw new Exception("内置文件校验失败："+name);
+    if(hash!=expected[name])throw new Exception(InstallerLanguage.T("内置文件校验失败：", "Embedded file verification failed: ")+name);
     result.Add(new PatchFile{Name=name,Bytes=bytes,Hash=hash});}
   }
   return result;
  }
  public static PatchFile LoadExtra(string name){
   using(var input=Assembly.GetExecutingAssembly().GetManifestResourceStream("Payload."+name)){
-   if(input==null)throw new Exception("安装包缺少自动加载器。");using(var buffer=new MemoryStream()){input.CopyTo(buffer);byte[] bytes=buffer.ToArray();string hash=Hash(bytes);if(hash!=PayloadHashes.Values[name])throw new Exception("自动加载器校验失败。");return new PatchFile{Name=name,Bytes=bytes,Hash=hash};}
+   if(input==null)throw new Exception(InstallerLanguage.T("安装包缺少自动加载器。", "The installer is missing the autoloader."));using(var buffer=new MemoryStream()){input.CopyTo(buffer);byte[] bytes=buffer.ToArray();string hash=Hash(bytes);if(hash!=PayloadHashes.Values[name])throw new Exception(InstallerLanguage.T("自动加载器校验失败。", "Autoloader verification failed."));return new PatchFile{Name=name,Bytes=bytes,Hash=hash};}
   }
  }
 }

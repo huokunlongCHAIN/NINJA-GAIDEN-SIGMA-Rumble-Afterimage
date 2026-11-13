@@ -11,6 +11,7 @@ static class AutoLoader {
  static string log;
  static void Log(string message){try{File.AppendAllText(log,DateTime.UtcNow.ToString("o")+" "+message+"\r\n");}catch{}}
  [STAThread]static int Main(string[] args){
+  InstallerLanguage.Load();
   try{
    if(args.Length!=2||args[0]!="--watch")return 2;
    string root=Path.GetFullPath(args[1]).TrimEnd(Path.DirectorySeparatorChar),folder=Path.Combine(root,"NGS1RumbleRuntime"),self=Assembly.GetExecutingAssembly().Location;

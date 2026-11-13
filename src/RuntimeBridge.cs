@@ -22,17 +22,17 @@ public static class RuntimeBridge {
  public static void Inject(Process process,string path){
   process.Refresh();if(process.Modules.Cast<ProcessModule>().Any(m=>String.Equals(m.FileName,path,StringComparison.OrdinalIgnoreCase)))return;
   IntPtr local=GetProcAddress(GetModuleHandle("kernel32.dll"),"LoadLibraryW"),owner;
-  if(local==IntPtr.Zero||!GetModuleHandleEx(6,local,out owner))throw new Exception("无法定位系统加载器。");
+  if(local==IntPtr.Zero||!GetModuleHandleEx(6,local,out owner))throw new Exception(InstallerLanguage.T("无法定位系统加载器。", "Could not locate the Windows loader."));
   var filename=new StringBuilder(32768);GetModuleFileName(owner,filename,filename.Capacity);string name=Path.GetFileName(filename.ToString());
-  var remote=process.Modules.Cast<ProcessModule>().SingleOrDefault(m=>String.Equals(Path.GetFileName(m.FileName),name,StringComparison.OrdinalIgnoreCase));if(remote==null)throw new Exception("目标进程缺少匹配的系统加载器。");
+  var remote=process.Modules.Cast<ProcessModule>().SingleOrDefault(m=>String.Equals(Path.GetFileName(m.FileName),name,StringComparison.OrdinalIgnoreCase));if(remote==null)throw new Exception(InstallerLanguage.T("目标进程缺少匹配的系统加载器。", "The game process has no matching Windows loader."));
   IntPtr entry=new IntPtr(remote.BaseAddress.ToInt64()+local.ToInt64()-owner.ToInt64());byte[] data=Encoding.Unicode.GetBytes(path+"\0");IntPtr handle=OpenProcess(0x43a,false,process.Id),buffer=IntPtr.Zero,thread=IntPtr.Zero;bool finished=false;
-  if(handle==IntPtr.Zero)throw new Exception("无法访问游戏进程，错误 "+Marshal.GetLastWin32Error());
+  if(handle==IntPtr.Zero)throw new Exception(InstallerLanguage.T("无法访问游戏进程，错误 ", "Could not access the game process. Windows error ")+Marshal.GetLastWin32Error());
   try{
    buffer=VirtualAllocEx(handle,IntPtr.Zero,(UIntPtr)data.Length,0x3000,4);UIntPtr written;
-   if(buffer==IntPtr.Zero||!WriteProcessMemory(handle,buffer,data,(UIntPtr)data.Length,out written)||written.ToUInt64()!=(ulong)data.Length)throw new Exception("无法传递运行库路径，错误 "+Marshal.GetLastWin32Error());
-   thread=CreateRemoteThread(handle,IntPtr.Zero,UIntPtr.Zero,entry,buffer,0,IntPtr.Zero);if(thread==IntPtr.Zero)throw new Exception("无法加载震动运行库，错误 "+Marshal.GetLastWin32Error());
-   finished=WaitForSingleObject(thread,10000)==0;if(!finished)throw new Exception("运行库加载超时，未重复注入。");
-   process.Refresh();if(!process.Modules.Cast<ProcessModule>().Any(m=>String.Equals(m.FileName,path,StringComparison.OrdinalIgnoreCase)))throw new Exception("系统未能加载震动运行库。");
+   if(buffer==IntPtr.Zero||!WriteProcessMemory(handle,buffer,data,(UIntPtr)data.Length,out written)||written.ToUInt64()!=(ulong)data.Length)throw new Exception(InstallerLanguage.T("无法传递运行库路径，错误 ", "Could not send the runtime path. Windows error ")+Marshal.GetLastWin32Error());
+   thread=CreateRemoteThread(handle,IntPtr.Zero,UIntPtr.Zero,entry,buffer,0,IntPtr.Zero);if(thread==IntPtr.Zero)throw new Exception(InstallerLanguage.T("无法加载震动运行库，错误 ", "Could not load the patch runtime. Windows error ")+Marshal.GetLastWin32Error());
+   finished=WaitForSingleObject(thread,10000)==0;if(!finished)throw new Exception(InstallerLanguage.T("运行库加载超时，未重复注入。","The patch runtime timed out. The loader did not retry."));
+   process.Refresh();if(!process.Modules.Cast<ProcessModule>().Any(m=>String.Equals(m.FileName,path,StringComparison.OrdinalIgnoreCase)))throw new Exception(InstallerLanguage.T("系统未能加载震动运行库。", "Windows could not load the patch runtime."));
   }finally{if(thread!=IntPtr.Zero)CloseHandle(thread);if(buffer!=IntPtr.Zero&&(thread==IntPtr.Zero||finished))VirtualFreeEx(handle,buffer,UIntPtr.Zero,0x8000);CloseHandle(handle);}
  }
  [DllImport("kernel32.dll",SetLastError=true)]static extern IntPtr OpenProcess(uint access,bool inherit,int pid);

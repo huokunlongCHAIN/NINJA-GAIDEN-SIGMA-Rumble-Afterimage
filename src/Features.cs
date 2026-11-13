@@ -14,7 +14,13 @@ public sealed class AfterimagePreset {
  public int Brightness=68,Opacity=40,Red=144,Green=163,Blue=253;
  public int MuscleHighlight=45;
  public static readonly string[] Sections={"Afterimage.Black","Afterimage.Purple","Afterimage.Blue","Afterimage.Ashtar","Afterimage.Grip"};
- public static readonly string[] Labels={"默认黑衣","初期紫色忍者服","蓝色传说忍者服","Ashtar 盔甲","杀戮凶手"};
+ public static string[] Labels {
+  get {
+   return InstallerLanguage.English?
+    new[]{"Legendary Black Falcon","Purple Ninja Outfit","Legendary Ninja (Blue)","Ashtar Armor","Grip of Murder"}:
+    new[]{"默认黑衣","初期紫色忍者服","蓝色传说忍者服","Ashtar 盔甲","杀戮凶手"};
+  }
+ }
  public static bool ShowsMuscleHighlight(int costume){return costume==0||costume==2||costume==4;}
  static int Number(string ini,string section,string key,int fallback,int max){
   int value;
@@ -61,7 +67,7 @@ public sealed class FeatureFacade {
    mutex=new Mutex(false,"Local\\NGS1FeatureSettings-"+RuntimeBridge.Key(root));
    bool acquired;
    try{acquired=mutex.WaitOne(0);}catch(AbandonedMutexException){acquired=true;}
-   if(!acquired){mutex.Dispose();throw new Exception("另一个补丁操作正在修改此目录。");}
+   if(!acquired){mutex.Dispose();throw new Exception(InstallerLanguage.T("另一个补丁操作正在修改此目录。", "Another patch operation is modifying this folder."));}
   }
   public void Dispose(){mutex.ReleaseMutex();mutex.Dispose();}
  }
@@ -99,11 +105,15 @@ public sealed class FeatureFacade {
   bool nextRumble=rumble??current.Rumble,nextDS=ds??current.DualSense,nextAfterimage=afterimage??current.Afterimage;
   if(!nextRumble&&!nextDS&&!nextAfterimage)return core.Restore(root);
   GameCompatibility.Validate(Path.Combine(root,Payload.ExeName));if(!current.CanInstall)throw new Exception(current.Description);
-  if(nextAfterimage&&!current.CanInstallAfterimage)throw new Exception("此游戏构建的渲染入口尚未验证。请确认未安装其他会修改游戏程序的补丁。");
+  if(nextAfterimage&&!current.CanInstallAfterimage)throw new Exception(InstallerLanguage.T("此游戏构建的渲染入口尚未验证。请确认未安装其他会修改游戏程序的补丁。", "The rendering entry point for this game build has not been verified. Check whether another patch modified the executable."));
   var selected=SelectPayload(root,nextRumble,nextDS,nextAfterimage);var compatibility=GameCompatibility.Inspect(Path.Combine(root,Payload.ExeName));
   string message=compatibility.Family=="original-code"?LaunchEngine.Install(root,true,selected):new PatchEngine(null,selected).Install(root);
-  return "震动 "+(nextRumble?"开启":"关闭")+" · PS5 手柄 "+(nextDS?"开启":"关闭")+" · 残影 "+(nextAfterimage?"开启":"关闭")+"。\r\n可直接打开游戏 EXE，或点击“启动游戏”。\r\n"+message;
+  return String.Format(InstallerLanguage.T(
+   "震动 {0} · PS5 手柄 {1} · 残影 {2}。\r\n可直接打开游戏 EXE，或点击“启动游戏”。\r\n{3}",
+   "Rumble {0} · DualSense {1} · Afterimages {2}.\r\nOpen the game EXE or click Launch Game.\r\n{3}"),
+   EnabledText(nextRumble),EnabledText(nextDS),EnabledText(nextAfterimage),message);
  }
+ static string EnabledText(bool enabled){return enabled?InstallerLanguage.T("开启","on"):InstallerLanguage.T("关闭","off");}
  public string InstallRumble(string root){return Change(root,true,null);}
  public string InstallDualSense(string root){return Change(root,null,true);}
  public string RestoreRumble(string root){return Change(root,false,null);}
@@ -119,12 +129,14 @@ public sealed class FeatureFacade {
   string root=PatchEngine.Root(input);
   using(var guard=new FeatureLock(root)){
    var info=Inspect(root);
-   if(!info.Afterimage||!info.CanInstallAfterimage)throw new Exception("请先在这个目录安装残影补丁。");
+   if(!info.Afterimage||!info.CanInstallAfterimage)throw new Exception(InstallerLanguage.T("请先在这个目录安装残影补丁。", "Install afterimages for this game folder first."));
    string file=PatchEngine.Child(info.ConfigRoot,"NGS1Rumble.ini");
    var bytes=new UTF8Encoding(false).GetBytes(preset.Write(File.ReadAllText(file),costume));
    PatchEngine.AtomicWrite(file,bytes);
   }
-  return AfterimagePreset.Labels[costume]+"的残影设置已保存。游戏运行中会自动重载。";
+  return String.Format(InstallerLanguage.T(
+   "{0}的残影设置已保存。游戏运行中会自动重载。",
+   "Afterimage settings saved for {0}. A running game reloads them automatically."),AfterimagePreset.Labels[costume]);
  }
  public int Launch(string input){
   string root=PatchEngine.Root(input);var current=Inspect(root);bool patched=current.Rumble||current.DualSense||current.Afterimage;

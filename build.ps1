@@ -49,13 +49,13 @@ $payloadSource=[IO.File]::ReadAllText((Join-Path $base 'src\Payload.cs'))
 $version=[regex]::Match($payloadSource,'Version="([^"]+)"').Groups[1].Value
 $autoSource='namespace NgsRumblePatch { public static class AutoLoaderConstants { public const string Version="'+$version+'"; public const string CoreHash="'+$coreHash+'"; } }'
 [IO.File]::WriteAllText((Join-Path $base 'build\AutoLoaderConstants.cs'),$autoSource,[Text.UTF8Encoding]::new($false))
-$inputRows=@('AutoLoader.cs','GameCompatibility.cs','RuntimeBridge.cs') | ForEach-Object {$_+':'+(Get-FileHash -LiteralPath (Join-Path $base ('src\'+$_))).Hash}
+$inputRows=@('AutoLoader.cs','GameCompatibility.cs','RuntimeBridge.cs','InstallerLanguage.cs') | ForEach-Object {$_+':'+(Get-FileHash -LiteralPath (Join-Path $base ('src\'+$_))).Hash}
 $inputRows+=@('Version:'+$version,'CoreHash:'+$coreHash,'Compiler:'+(Get-FileHash -LiteralPath $csc).Hash)
 $sha=[Security.Cryptography.SHA256]::Create();try{$inputHash=[BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($inputRows -join "`n")))).Replace('-','')}finally{$sha.Dispose()}
 $cachePath=Join-Path $base 'build\autoloader-build.json';$autoPath=Join-Path $base 'payload\NGS1RumbleAuto.exe';$reuse=$false
 if((Test-Path -LiteralPath $cachePath) -and (Test-Path -LiteralPath $autoPath)){$cache=Get-Content -LiteralPath $cachePath -Raw -Encoding utf8|ConvertFrom-Json;$reuse=$cache.inputHash -eq $inputHash -and $cache.binaryHash -eq (Get-FileHash -LiteralPath $autoPath).Hash}
 if(!$reuse){
- & $csc @common '/target:winexe' ('/out:'+$autoPath) (Join-Path $base 'src\AutoLoader.cs') (Join-Path $base 'src\GameCompatibility.cs') (Join-Path $base 'src\RuntimeBridge.cs') (Join-Path $base 'build\AutoLoaderConstants.cs')
+ & $csc @common '/target:winexe' ('/out:'+$autoPath) (Join-Path $base 'src\AutoLoader.cs') (Join-Path $base 'src\GameCompatibility.cs') (Join-Path $base 'src\RuntimeBridge.cs') (Join-Path $base 'src\InstallerLanguage.cs') (Join-Path $base 'build\AutoLoaderConstants.cs')
  if($LASTEXITCODE -ne 0){throw 'Autoloader build failed'}
  @{inputHash=$inputHash;binaryHash=(Get-FileHash -LiteralPath $autoPath).Hash}|ConvertTo-Json|Set-Content -LiteralPath $cachePath -Encoding utf8
 }
@@ -71,7 +71,7 @@ $csc='C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $common=@('/nologo','/platform:x64','/optimize+','/reference:System.Core.dll','/reference:System.Web.Extensions.dll')
 $resources=@()
 foreach($name in @('dinput8.dll','NGS1Rumble.ini','NGS1RumbleRules.ini','NGS1RumbleWaves.ini','NGS1RumbleAuto.exe')){$resources+=('/resource:'+(Join-Path $base ('payload\'+$name))+',Payload.'+$name)}
-$engineSources=@('Payload.cs','PatchEngine.cs','GameCompatibility.cs','Launcher.cs','CleanUninstall.cs','RuntimeBridge.cs','AutoLifecycle.cs','Features.cs') | ForEach-Object {Join-Path $base ('src\'+$_)}
+$engineSources=@('Payload.cs','PatchEngine.cs','GameCompatibility.cs','Launcher.cs','CleanUninstall.cs','RuntimeBridge.cs','AutoLifecycle.cs','Features.cs','InstallerLanguage.cs') | ForEach-Object {Join-Path $base ('src\'+$_)}
 & $csc @common '/target:winexe' '/reference:System.Windows.Forms.dll' '/reference:System.Drawing.dll' ('/out:'+(Join-Path $base 'release\NGS1RumblePatch.exe')) @engineSources (Join-Path $base 'src\InstallerSession.cs') (Join-Path $base 'src\Program.cs') (Join-Path $base 'build\PayloadHashes.cs') (Join-Path $base 'build\ReleasedCoreHashes.cs') @resources
 if($LASTEXITCODE -ne 0){throw 'Installer build failed'}
 if(Test-Path -LiteralPath (Join-Path $base 'tests\InstallerTests.cs')){
