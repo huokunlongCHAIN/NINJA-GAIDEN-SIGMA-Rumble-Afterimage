@@ -362,6 +362,24 @@ int main() {
     assert(activeCostume == Costume::Grip && settings.alpha == 77);
     assert(DeleteFileW(tempIni));
     puts("Runtime reload applies only the active outfit's changed preset.");
+    ResetPoses();
+    airCombo = {};
+    DWORD foregroundOwner = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &foregroundOwner);
+    assert(foregroundOwner != GetCurrentProcessId());
+    // Submit a saved pose through the game's hooked Present path while the
+    // rendering window is in the background.
+    auto& backgroundTrail = res.trail[0];
+    backgroundTrail.Begin(renderFrame - 1, PoseClockUs());
+    backgroundTrail.parts = {packet};
+    backgroundTrail.count = 1;
+    backgroundTrail.fadeFrames = 9;
+    res.nextTrail = 1;
+    res.cameraFrame = renderFrame;
+    const unsigned beforeBackgroundPresent = loggedOverlays;
+    ObservePresent(swap.Get(), 0, 0);
+    assert(loggedOverlays == beforeBackgroundPresent + 1);
+    puts("The hooked Present composites a saved pose without foreground focus.");
     hooksReady = false;
     MH_Uninitialize();
     DestroyWindow(window);

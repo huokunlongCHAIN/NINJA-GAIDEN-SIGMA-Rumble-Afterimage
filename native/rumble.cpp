@@ -44,7 +44,6 @@ static std::atomic<DWORD> lastController{0}, testPacked{0}, dropped{0};
 static std::atomic<unsigned> eventGeneration{0};
 static std::atomic<bool> stopRequested{false};
 static std::atomic<DWORD> nativePacked[4];
-static std::atomic<DWORD> controllerButtons[4];
 static ULONGLONG startTick;
 static INIT_ONCE proxyOnce = INIT_ONCE_STATIC_INIT;
 typedef DWORD (WINAPI* GetStateFn)(DWORD, XINPUT_STATE*);
@@ -314,9 +313,11 @@ static void LoadRules() {
     Print("RULES_LOADED count=%u",ruleCount);
 }
 
+// Gameplay feedback follows accepted game events, including in a background
+// window. Foreground ownership is only used for keyboard shortcuts and telemetry.
 static void HandleSoundEvent(const Event& event) {
     if(!rumbleEnabled)return;
-    if(!foreground || muted || testing)return;
+    if(muted || testing)return;
     if(event.generation!=eventGeneration.load())return;
     ULONGLONG eventTime=startTick+event.tick;
     if(GetTickCount64()-eventTime>120)return;
@@ -445,7 +446,7 @@ static DWORD WINAPI ObserveSet(DWORD index, XINPUT_VIBRATION* request) {
     DWORD packed = Pack(request->wLeftMotorSpeed, request->wRightMotorSpeed);
     DWORD previous = index < 4 ? nativePacked[index].exchange(packed) : ~packed;
     XINPUT_VIBRATION output = *request;
-    if (muted || !foreground) output = {};
+    if (muted) output = {};
     else if (testing && index == lastController) output = Unpack(testPacked);
     else if (ownsOutput && index==lastController) output=MaxOutput(output,Unpack(ownedPacked));
     DWORD result = SendMotorOutput(index, &output);
@@ -466,9 +467,8 @@ static DWORD WINAPI ObserveGet(DWORD index, XINPUT_STATE* state) {
         static std::atomic<DWORD> previous[4];
         DWORD buttons = state->Gamepad.wButtons | (DWORD(state->Gamepad.bLeftTrigger > 100) << 16)
                         | (DWORD(state->Gamepad.bRightTrigger > 100) << 17);
-        controllerButtons[index]=buttons;
         DWORD oldButtons=previous[index].exchange(buttons);
-        if(foreground && ((buttons&~oldButtons)&(XINPUT_GAMEPAD_START|XINPUT_GAMEPAD_BACK)))stopRequested=true;
+        if((buttons&~oldButtons)&(XINPUT_GAMEPAD_START|XINPUT_GAMEPAD_BACK))stopRequested=true;
         if (oldButtons != buttons) {
             Event event{}; event.kind = 3; event.index = index; event.buttons = buttons;
             event.caller = ReturnRva(__builtin_return_address(0)); Enqueue(event, false);
@@ -494,7 +494,7 @@ static void ObservePad(void* pad, float left, float right) {
 static int ObserveSound(unsigned code, void* parameters) {
     uintptr_t caller = ReturnRva(__builtin_return_address(0));
     int result = originalSound(code, parameters);
-    if (foreground && result != -1) {
+    if (result != -1) {
         Event event{}; event.kind=4; event.index=code; event.result=DWORD(result);
         event.buttons=*reinterpret_cast<DWORD*>(static_cast<BYTE*>(parameters)+0x214);
         event.object=reinterpret_cast<uintptr_t>(parameters); event.caller=caller;
@@ -619,7 +619,7 @@ static DWORD WINAPI Worker(void*) {
                time.wYear,time.wMonth,time.wDay,time.wHour,time.wMinute,time.wSecond,GetCurrentProcessId());
     swprintf_s(iniPath, L"%s\\NGS1Rumble.ini", root);
     logFile = _wfsopen(logPath, L"wb", _SH_DENYNO); if (!logFile) return 0;
-    Print("NGS1 Modular Controller Core 0.7.3 pid=%lu", GetCurrentProcessId());
+    Print("NGS1 Modular Controller Core 0.7.4 pid=%lu", GetCurrentProcessId());
     wchar_t executable[MAX_PATH]; GetModuleFileNameW(nullptr, executable, MAX_PATH);
     char hash[65]{}; bool hashOk = HashFile(executable, hash);
     Print("exe_sha256=%s", hashOk ? hash : "READ_ERROR");
@@ -748,11 +748,11 @@ static DWORD WINAPI Worker(void*) {
         if(dualSenseEnabled&&controllerRouter.Poll(realGetState,dualSense,preferDualSense)){StopAll();Print("ACTIVE_CONTROLLER source=%s",controllerRouter.IsDualSense()?"DualSense":"XInput");}
         if(autoIcons)ControllerIcons::Select(DualSenseRoute(0));
         ULONGLONG now=GetTickCount64(); bool focus=GameForeground(); foreground=focus;
-        if (focus != oldFocus) { if (!focus) StopAll(); Print("FOCUS %u", focus); oldFocus=focus; }
+        if (focus != oldFocus) { Print("FOCUS %u", focus); oldFocus=focus; }
         bool f5=(GetAsyncKeyState(VK_F5)&0x8001)!=0, f6=(GetAsyncKeyState(VK_F6)&0x8001)!=0, f7=(GetAsyncKeyState(VK_F7)&0x8001)!=0, f9=(GetAsyncKeyState(VK_F9)&0x8001)!=0;
         bool esc=(GetAsyncKeyState(VK_ESCAPE)&0x8001)!=0;
         bool menuStop=stopRequested.exchange(false);
-        if(focus && ((esc&&!previousEsc)||menuStop)) {StopAll();Print("MENU_INPUT_STOP");}
+        if((focus&&esc&&!previousEsc)||menuStop) {StopAll();Print("MENU_INPUT_STOP");}
         previousEsc=esc;
         DWORD monitorCommand=MonitorPollCommand();
         if(monitorCommand){
@@ -785,7 +785,7 @@ static DWORD WINAPI Worker(void*) {
                 StopAll(); Print("SELF_TEST_END result=%lu stopped=1", result);
             }
         }
-        if (rumbleEnabled&&!testing && focus && !muted) {
+        if (rumbleEnabled&&!testing && !muted) {
             MotorOutput pulse=mixer.sample(now,4,true);
             int oldAction=actionSustain.active();
             unsigned scriptOffset=ReadPlayerScriptOffset();
@@ -798,10 +798,17 @@ static DWORD WINAPI Worker(void*) {
             if(actionPulse.left>pulse.left)pulse.left=actionPulse.left;
             if(actionPulse.right>pulse.right)pulse.right=actionPulse.right;
             MotorOutput chargePulse=mixer.sample(now,4,false);
-            DWORD controller=lastController;
-            bool chargeHeld=controller<4 && (controllerButtons[controller]&XINPUT_GAMEPAD_Y)!=0;
-            if(chargeHeld)chargeState.renew(now);
-            else if(chargeState.sustaining(now)){chargeState.finish(now);mixer.cancel(4);}
+            bool chargeHeld=false;
+            if(chargeState.sustaining(now)){
+                XINPUT_STATE input{};
+                DWORD controller=lastController;
+                // The game may stop polling on focus loss or pause. Read the
+                // controller directly so a held Y cannot leave stale output.
+                chargeHeld=controller<4 && ReadControllerState(controller,&input)==ERROR_SUCCESS &&
+                    (input.Gamepad.wButtons&XINPUT_GAMEPAD_Y)!=0;
+                if(chargeHeld)chargeState.renew(now);
+                else {chargeState.finish(now);mixer.cancel(4);}
+            }
             MotorOutput sustained=SampleChargeCurve(chargeState,chargeCurve,now,chargeHeld);
             if(sustained.left>chargePulse.left)chargePulse.left=sustained.left;
             if(sustained.right>chargePulse.right)chargePulse.right=sustained.right;

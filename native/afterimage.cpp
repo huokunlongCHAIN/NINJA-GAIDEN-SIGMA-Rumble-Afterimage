@@ -260,7 +260,6 @@ std::wstring ini;
 FILE* logFile = nullptr;
 std::atomic<ULONGLONG> previewUntil{0};
 std::atomic<ULONGLONG> captureUntil{0};
-std::atomic<bool> focus{false};
 uintptr_t gameBase = 0;
 Action activeAction = Action::None;
 uint64_t lastActionFrame = 0;
@@ -1081,7 +1080,7 @@ bool InspectDraw(Context* c, const Draw& draw) {
         std::find(DragonGearMeshes.begin(), DragonGearMeshes.end(), key) != DragonGearMeshes.end();
     if (!capture && !selected && !gear) return false;
     const auto nowUs = PoseClockUs();
-    const bool active = settings.enabled && focus;
+    const bool active = settings.enabled;
     if (active && (selected || gear)) UpdateAction();
     const float body = active && (selected || gear) ? effectFrame.body : 1;
     const bool color = state.ps && state.targets[0];
@@ -1593,14 +1592,15 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
 }
 
 HRESULT STDMETHODCALLTYPE ObservePresent(IDXGISwapChain* swap, UINT syncInterval, UINT flags) {
+    // A windowed swap chain can keep presenting after another window gains focus.
     if (hooksReady && swap == gameSwap && !(flags & DXGI_PRESENT_TEST)) {
         std::lock_guard<std::recursive_mutex> guard(renderMutex);
         for (auto& entry : resources) {
             auto& res = entry.second;
             try {
-                if (settings.enabled && focus) BuildOverlayDraws(res, PoseClockUs());
+                if (settings.enabled) BuildOverlayDraws(res, PoseClockUs());
                 if (res.overlayDraws.empty()) continue;
-                if (settings.enabled && focus && !RenderOverlay(swap, entry.first, res) && loggedOverlays++ < 16)
+                if (settings.enabled && !RenderOverlay(swap, entry.first, res) && loggedOverlays++ < 16)
                     Log("OVERLAY_DRAW_FAILED");
             } catch (...) {
                 Log("OVERLAY_DRAW_FAILED exception");
@@ -1832,7 +1832,7 @@ DWORD WINAPI PollAfterimage(void*) {
     for (;;) {
         DWORD owner = 0;
         GetWindowThreadProcessId(GetForegroundWindow(), &owner);
-        focus = owner == GetCurrentProcessId();
+        const bool focus = owner == GetCurrentProcessId();
         bool control = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
         bool previewKey = focus && control && (GetAsyncKeyState(VK_F11) & 0x8000);
         bool stopKey = focus && control && (GetAsyncKeyState(VK_F12) & 0x8000);
@@ -1874,7 +1874,7 @@ bool StartAfterimage(const wchar_t* root, GameCompatibility::Kind kind, Controll
     logFile = _wfsopen((directory + L"\\NGS1Afterimage.log").c_str(), L"wb", _SH_DENYNO);
     gameBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     controllerHooks = shared;
-    Log("GAME pid=%lu build=%s afterimage=0.6.3", GetCurrentProcessId(), GameCompatibility::Name(kind));
+    Log("GAME pid=%lu build=%s afterimage=0.6.5", GetCurrentProcessId(), GameCompatibility::Name(kind));
     if (GetModuleHandleW(L"NGS1Afterimage.dll")) {
         Log("LEGACY_AFTERIMAGE_ALREADY_LOADED");
         return false;

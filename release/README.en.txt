@@ -1,6 +1,7 @@
-Ninja Gaiden Sigma Enhancements 0.6.4
+Ninja Gaiden Sigma Enhancements 0.6.5
 
 Choose English or 简体中文 in the upper-right corner of the installer. Changes apply immediately, and the installer remembers your selection.
+In windowed mode, rumble and afterimages follow gameplay when the pointer leaves the game window or another window gains focus.
 
 Installation and restore
 1. Exit the game. Extract the package, run NGS1RumblePatch.exe, and select NINJA GAIDEN SIGMA.exe.
