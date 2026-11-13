@@ -102,7 +102,7 @@ $resources=@()
 foreach($name in @('dinput8.dll','NGS1Rumble.ini','NGS1RumbleRules.ini','NGS1RumbleWaves.ini','NGS1RumbleAuto.exe')){$resources+=('/resource:'+(Join-Path $base ('payload\'+$name))+',Payload.'+$name)}
 $engineSources=@('Payload.cs','PatchEngine.cs','GameCompatibility.cs','Launcher.cs','CleanUninstall.cs','RuntimeBridge.cs','AutoLifecycle.cs','Features.cs','InstallerLanguage.cs') | ForEach-Object {Join-Path $base ('src\'+$_)}
 $installer=Join-Path $base 'release\NGS1RumblePatch.exe'
-& $csc @common '/target:winexe' '/reference:System.Windows.Forms.dll' '/reference:System.Drawing.dll' ('/out:'+$installer) @engineSources (Join-Path $base 'src\InstallerSession.cs') (Join-Path $base 'src\Program.cs') (Join-Path $base 'src\RoundedControls.cs') $metadataPath (Join-Path $base 'build\PayloadHashes.cs') (Join-Path $base 'build\ReleasedCoreHashes.cs') @resources
+& $csc @common '/target:winexe' '/reference:System.Windows.Forms.dll' '/reference:System.Drawing.dll' '/reference:System.IO.Compression.dll' '/reference:System.Xml.Linq.dll' ('/out:'+$installer) @engineSources (Join-Path $base 'src\InstallerSession.cs') (Join-Path $base 'src\Program.cs') (Join-Path $base 'src\RoundedControls.cs') (Join-Path $base 'src\PatchDiagnostics.cs') $metadataPath (Join-Path $base 'build\PayloadHashes.cs') (Join-Path $base 'build\ReleasedCoreHashes.cs') @resources
 if($LASTEXITCODE -ne 0){throw 'Installer build failed'}
 Sign-PatchBinary $installer
 if(Test-Path -LiteralPath (Join-Path $base 'tests\InstallerTests.cs')){

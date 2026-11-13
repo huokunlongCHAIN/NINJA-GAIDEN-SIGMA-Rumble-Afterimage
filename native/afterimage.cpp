@@ -42,7 +42,7 @@ constexpr unsigned FadeSteps = 24;
 constexpr unsigned PoseHistorySize = 12;
 constexpr unsigned MaxGhostLayers = 12;
 constexpr unsigned MaxSurfaceBrightness = 200;
-constexpr unsigned MaxSigma2GlowStrength = 200;
+constexpr unsigned MaxGlowStrength = 200;
 
 enum Slot : unsigned {
     VsConstants = 7, PsShader = 9, VsShader = 11, Indexed = 12,
@@ -1971,7 +1971,7 @@ void ReadSettings() {
                 return static_cast<unsigned>(std::clamp(value, 0, static_cast<int>(maximum)));
             };
             return {read(L"OpacityPercent", 40, 100),
-                read(L"GlowStrengthPercent", 68, settings.glassVisual ? MaxSigma2GlowStrength : 100),
+                read(L"GlowStrengthPercent", 68, MaxGlowStrength),
                 {read(L"TintR", 144, 255), read(L"TintG", 163, 255), read(L"TintB", 253, 255)},
                 exposedSkin ? read(L"MuscleHighlightPercent", 45, 100) : 0,
                 read(L"SurfaceBrightnessPercent", 100, MaxSurfaceBrightness)};
@@ -2078,7 +2078,7 @@ bool StartAfterimage(const wchar_t* root, GameCompatibility::Kind kind, Controll
     logFile = _wfsopen((directory + L"\\NGS1Afterimage.log").c_str(), L"wb", _SH_DENYNO);
     gameBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     controllerHooks = shared;
-    Log("GAME pid=%lu build=%s afterimage=0.6.9", GetCurrentProcessId(), GameCompatibility::Name(kind));
+    Log("GAME pid=%lu build=%s afterimage=0.6.11", GetCurrentProcessId(), GameCompatibility::Name(kind));
     if (GetModuleHandleW(L"NGS1Afterimage.dll")) {
         Log("LEGACY_AFTERIMAGE_ALREADY_LOADED");
         return false;

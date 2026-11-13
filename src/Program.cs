@@ -11,34 +11,72 @@ static class Program {
  [STAThread]static int Main(string[] args){
   // Preserve existing CLI output for automation. The UI uses the saved preference.
   if(args.Length==0||args[0]=="--ui")InstallerLanguage.Load();
+  AppDomain.CurrentDomain.UnhandledException+=(s,e)=>{
+   var error=e.ExceptionObject as Exception;
+   if(error!=null)PatchDiagnostics.Failure("installer-unhandled",null,error);
+  };
   try{if(InstallerSession.Initialize(ref args))return 0;}catch(Exception error){
+   PatchDiagnostics.Failure("installer-session",null,error);
    if(args.Length==3)File.WriteAllText(args[2],new JavaScriptSerializer().Serialize(new{ok=false,message=error.Message}),new UTF8Encoding(false));
    else MessageBox.Show(error.Message,InstallerLanguage.T("西格玛1 功能补丁","Ninja Gaiden Sigma Enhancements"));
    return 1;
   }
-  if(args.Length==2&&args[0]=="--ui"){Show(args[1]);return 0;}
-  if(args.Length>0){try{var features=new FeatureFacade();if(args.Length==2&&args[0]=="--launch"){features.Launch(args[1]);return 0;}if(args.Length!=3)throw new Exception("Usage: operation <game folder> <result.json>");string result;
-    if(args[0]=="--inspect")result=new JavaScriptSerializer().Serialize(features.Inspect(args[1]));
-    else if(args[0]=="--launch")result=new JavaScriptSerializer().Serialize(new{ok=true,pid=features.Launch(args[1])});
-    else{string message;
-     switch(args[0]){
-      case "--install":case "--install-rumble":message=features.InstallRumble(args[1]);break;
-      case "--install-ps5":message=features.InstallDualSense(args[1]);break;
-      case "--install-afterimage":message=features.InstallAfterimage(args[1]);break;
-      case "--restore-rumble":message=features.RestoreRumble(args[1]);break;
-      case "--restore-ps5":message=features.RestoreDualSense(args[1]);break;
-      case "--restore-afterimage":message=features.RestoreAfterimage(args[1]);break;
-      case "--restore":message=features.RestoreAll(args[1]);break;
-      case "--prepare":message=new PatchFacade().Prepare(args[1]);break;
-      default:throw new Exception("Unknown operation");
-     }
-     result=new JavaScriptSerializer().Serialize(new{ok=true,started=false,message=message});
-    }
-    File.WriteAllText(args[2],result,new UTF8Encoding(false));return 0;
-   }catch(Exception error){if(args.Length==3)File.WriteAllText(args[2],new JavaScriptSerializer().Serialize(new{ok=false,started=false,message=error.Message}),new UTF8Encoding(false));else MessageBox.Show(error.Message,InstallerLanguage.T("西格玛1 功能补丁","Ninja Gaiden Sigma Enhancements"));return 1;}}
-  Show(null);return 0;
+  if(args.Length==0||args.Length==2&&args[0]=="--ui"){Show(args.Length==2?args[1]:null);return 0;}
+  string operation=args[0],root=args.Length>=2?args[1]:null;
+  var json=new JavaScriptSerializer();
+  try{
+   if(operation=="--export-diagnostics"&&args.Length==3){PatchDiagnostics.Export(root,args[2]);return 0;}
+   PatchDiagnostics.Log(operation,"BEGIN",root,"");
+   if(operation=="--launch"&&args.Length==2){
+    int pid=new FeatureFacade().Launch(root);
+    PatchDiagnostics.Log(operation,"OK",root,"pid="+pid);return 0;
+   }
+   if(args.Length!=3)throw new ArgumentException("Usage: operation <game folder> <result.json>");
+   var features=new FeatureFacade();
+   string result;
+   if(operation=="--inspect"){
+    var info=features.Inspect(root);
+    PatchDiagnostics.Log("inspect",info.CanInstall?"OK":"UNAVAILABLE",root,info.Description);
+    result=json.Serialize(info);
+   }else if(operation=="--launch"){
+    int pid=features.Launch(root);
+    PatchDiagnostics.Log(operation,"OK",root,"pid="+pid);
+    result=json.Serialize(new{ok=true,pid=pid});
+   }else{
+    string message=Change(features,operation,root);
+    PatchDiagnostics.Log(operation,"OK",root,message);
+    result=json.Serialize(new{ok=true,started=false,message=message});
+   }
+   File.WriteAllText(args[2],result,new UTF8Encoding(false));return 0;
+  }catch(Exception error){
+   PatchDiagnostics.Failure(operation,root,error);
+   if(operation=="--export-diagnostics")return 1;
+   if(args.Length==3)File.WriteAllText(args[2],json.Serialize(new{ok=false,started=false,message=error.Message}),new UTF8Encoding(false));
+   else MessageBox.Show(error.Message,InstallerLanguage.T("西格玛1 功能补丁","Ninja Gaiden Sigma Enhancements"));
+   return 1;
+  }
  }
- static void Show(string root){InstallerLanguage.Load();Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);Application.Run(new FeatureForm(root));}
+ static string Change(FeatureFacade features,string operation,string root){
+  switch(operation){
+   case "--install":case "--install-rumble":return features.InstallRumble(root);
+   case "--install-ps5":return features.InstallDualSense(root);
+   case "--install-afterimage":return features.InstallAfterimage(root);
+   case "--restore-rumble":return features.RestoreRumble(root);
+   case "--restore-ps5":return features.RestoreDualSense(root);
+   case "--restore-afterimage":return features.RestoreAfterimage(root);
+   case "--restore":return features.RestoreAll(root);
+   case "--prepare":return new PatchFacade().Prepare(root);
+   default:throw new ArgumentException("Unknown operation");
+  }
+ }
+ static void Show(string root){
+  InstallerLanguage.Load();
+  Application.ThreadException+=(s,e)=>{
+   PatchDiagnostics.Failure("installer-ui",root,e.Exception);
+   MessageBox.Show(e.Exception.Message,InstallerLanguage.T("西格玛1 功能补丁","Ninja Gaiden Sigma Enhancements"));
+  };
+  Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);Application.Run(new FeatureForm(root));
+ }
 }
 sealed class FeatureForm:Form {
  readonly FeatureFacade engine=new FeatureFacade();
@@ -51,7 +89,7 @@ sealed class FeatureForm:Form {
   transparency=new NumericUpDown(),muscleHighlight=new NumericUpDown();
  readonly TableLayoutPanel visuals;
  readonly Control muscleRow,surfaceBrightnessRow;
- RoundedButton browse,installRumble,restoreRumble,installDS,restoreDS,installAfterimage,restoreAfterimage,pickColor,savePreset,launch,restoreAll;
+ RoundedButton browse,installRumble,restoreRumble,installDS,restoreDS,installAfterimage,restoreAfterimage,pickColor,savePreset,launch,restoreAll,exportDiagnostics;
  Color tint;
  bool translating;
  public FeatureForm(string initial=null){
@@ -100,13 +138,16 @@ sealed class FeatureForm:Form {
   controllerPage.Controls.Add(Bind(new Label{Dock=DockStyle.Fill,ForeColor=Color.Silver},
    "PS5 手柄支持直接输入、热切换和 PS／Xbox 按键图标切换。",
    "DualSense supports direct input, hot switching, and automatic PS/Xbox button icons."),0,2);
-  installRumble.Click+=async(s,e)=>await Run(root=>engine.InstallRumble(root));restoreRumble.Click+=async(s,e)=>await Run(root=>engine.RestoreRumble(root));installDS.Click+=async(s,e)=>await Run(root=>engine.InstallDualSense(root));restoreDS.Click+=async(s,e)=>await Run(root=>engine.RestoreDualSense(root));
+  installRumble.Click+=async(s,e)=>await Run("install-rumble",engine.InstallRumble);
+  restoreRumble.Click+=async(s,e)=>await Run("restore-rumble",engine.RestoreRumble);
+  installDS.Click+=async(s,e)=>await Run("install-dualsense",engine.InstallDualSense);
+  restoreDS.Click+=async(s,e)=>await Run("restore-dualsense",engine.RestoreDualSense);
   visuals=Section(70,38,38,38,38,38,44,38,44);
   visual.Controls.Add(visuals);
   installAfterimage=Button("安装／更新残影","Install / Update Afterimages");restoreAfterimage=Button("还原残影","Restore Afterimages");
   visuals.Controls.Add(Card(afterimageState,installAfterimage,restoreAfterimage),0,0);
-  installAfterimage.Click+=async(s,e)=>await Run(root=>engine.InstallAfterimage(root));
-  restoreAfterimage.Click+=async(s,e)=>await Run(root=>engine.RestoreAfterimage(root));
+  installAfterimage.Click+=async(s,e)=>await Run("install-afterimage",engine.InstallAfterimage);
+  restoreAfterimage.Click+=async(s,e)=>await Run("restore-afterimage",engine.RestoreAfterimage);
   material.DropDownStyle=ComboBoxStyle.DropDownList;
   material.AccessibleName="残影材质 / Afterimage material";
   material.SelectedIndexChanged+=(s,e)=>{if(!translating)RefreshPreset();};
@@ -115,11 +156,12 @@ sealed class FeatureForm:Form {
   outfit.SelectedIndexChanged+=(s,e)=>{if(!translating)RefreshPreset();};
   visuals.Controls.Add(Field("服装","Costume",outfit),0,2);
   foreach(var number in new[]{transparency,muscleHighlight}){number.Minimum=0;number.Maximum=100;}
+  brightness.Maximum=AfterimagePreset.MaxGlowStrength;
   surfaceBrightness.Minimum=0;
   surfaceBrightness.Maximum=AfterimagePreset.MaxSurfaceBrightness;
-  surfaceBrightnessRow=Field("材质亮度（%）","Surface brightness (%)",surfaceBrightness);
+  surfaceBrightnessRow=Field("材质亮度（%）","Surface brightness (%)",surfaceBrightness,AfterimagePreset.MaxSurfaceBrightness);
   visuals.Controls.Add(surfaceBrightnessRow,0,3);
-  visuals.Controls.Add(Field("发光强度（%）","Glow strength (%)",brightness),0,4);
+  visuals.Controls.Add(Field("发光强度（%）","Glow strength (%)",brightness,AfterimagePreset.MaxGlowStrength),0,4);
   visuals.Controls.Add(Field("透明度（%）","Transparency (%)",transparency),0,5);
   pickColor=Button("#90A3FD","#90A3FD");
   pickColor.Click+=(s,e)=>{using(var dialog=new ColorDialog{Color=tint,FullOpen=true})if(dialog.ShowDialog(this)==DialogResult.OK)SetTint(dialog.Color);};
@@ -133,18 +175,28 @@ sealed class FeatureForm:Form {
    var preset=new AfterimagePreset{Brightness=(int)brightness.Value,SurfaceBrightness=(int)surfaceBrightness.Value,
     Opacity=100-(int)transparency.Value,
     MuscleHighlight=(int)muscleHighlight.Value,Red=tint.R,Green=tint.G,Blue=tint.B};
-   await Run(root=>engine.SavePreset(root,selected,preset,selectedMaterial));
+   await Run("save-afterimage-preset",root=>engine.SavePreset(root,selected,preset,selectedMaterial));
   };
   visuals.Controls.Add(Field("","",savePreset),0,8);
   details.Dock=DockStyle.Fill;details.Multiline=true;details.ReadOnly=true;details.ScrollBars=ScrollBars.Vertical;details.BackColor=Color.FromArgb(30,38,50);details.ForeColor=Color.Gainsboro;details.BorderStyle=BorderStyle.None;page.Controls.Add(details,0,4);
-  var actions=new FlowLayoutPanel{Dock=DockStyle.Fill,Margin=new Padding(0,8,0,0)};launch=Button("启动游戏","Launch Game");launch.Width=220;launch.Click+=async(s,e)=>await Run(root=>String.Format(InstallerLanguage.T("游戏已启动，进程 {0}","Game launched. Process ID {0}."),engine.Launch(root)));restoreAll=Button("全部还原","Restore All");restoreAll.Width=180;restoreAll.Click+=async(s,e)=>await Run(root=>engine.RestoreAll(root));actions.Controls.Add(launch);actions.Controls.Add(restoreAll);page.Controls.Add(actions,0,5);
+  var actions=new FlowLayoutPanel{Dock=DockStyle.Fill,Margin=new Padding(0,8,0,0)};
+  launch=Button("启动游戏","Launch Game");launch.Width=220;
+  launch.Click+=async(s,e)=>await Run("launch-game",root=>String.Format(InstallerLanguage.T(
+   "游戏已启动，进程 {0}","Game launched. Process ID {0}."),engine.Launch(root)));
+  restoreAll=Button("全部还原","Restore All");restoreAll.Width=180;
+  restoreAll.Click+=async(s,e)=>await Run("restore-all",engine.RestoreAll);
+  exportDiagnostics=Button("导出诊断包","Export Diagnostics");exportDiagnostics.Width=202;
+  exportDiagnostics.Glyph=ButtonGlyph.Export;
+  exportDiagnostics.Click+=async(s,e)=>await ExportDiagnostics();
+  actions.Controls.Add(launch);actions.Controls.Add(restoreAll);actions.Controls.Add(exportDiagnostics);
+  page.Controls.Add(actions,0,5);
   ApplyLanguage();
   browse.Glyph=ButtonGlyph.Folder;
   foreach(var button in new[]{installRumble,installDS,installAfterimage})button.Glyph=ButtonGlyph.Download;
   foreach(var button in new[]{restoreRumble,restoreDS,restoreAfterimage,restoreAll})button.Glyph=ButtonGlyph.Restore;
   savePreset.Glyph=ButtonGlyph.Save;
   launch.Glyph=ButtonGlyph.Play;
-  SetEnabled(false);Shown+=(s,e)=>{if(!String.IsNullOrWhiteSpace(initial))path.Text=initial;else{string here=AppDomain.CurrentDomain.BaseDirectory;var parent=Directory.GetParent(here.TrimEnd(Path.DirectorySeparatorChar));foreach(string root in new[]{here,parent==null?here:parent.FullName})if(File.Exists(Path.Combine(root,Payload.ExeName))){path.Text=root;break;}}RefreshState();};
+  SetEnabled(false);Shown+=(s,e)=>{if(!String.IsNullOrWhiteSpace(initial))path.Text=initial;else{string here=AppDomain.CurrentDomain.BaseDirectory;var parent=Directory.GetParent(here.TrimEnd(Path.DirectorySeparatorChar));foreach(string root in new[]{here,parent==null?here:parent.FullName})if(File.Exists(Path.Combine(root,Payload.ExeName))){path.Text=root;break;}}RefreshState(logInspection:true);};
  }
  static TableLayoutPanel Section(params int[] heights){
   var section=new TableLayoutPanel{Dock=DockStyle.Fill,Padding=new Padding(12),ColumnCount=1,AutoScroll=true};
@@ -173,10 +225,15 @@ sealed class FeatureForm:Form {
    "Install and restore each feature separately. Open the game EXE after installing.\r\nIn Afterimages, choose a material and costume, then click Save and Apply Material.");
   translating=false;
  }
- Control Field(string chinese,string english,Control value){
+ Control Field(string chinese,string english,Control value,int? limit=null){
   var row=new FlowLayoutPanel{Dock=DockStyle.Fill,WrapContents=false};
   row.Controls.Add(Bind(new Label{Width=160,Height=30,TextAlign=ContentAlignment.MiddleLeft},chinese,english));
-  value.Width=Math.Max(212,value.Width);row.Controls.Add(value);return row;
+  value.Width=Math.Max(212,value.Width);
+  row.Controls.Add(value);
+  if(limit.HasValue)row.Controls.Add(Bind(new Label{AutoSize=false,Width=145,Height=30,
+   TextAlign=ContentAlignment.MiddleLeft,Margin=new Padding(12,0,0,0),ForeColor=Color.LightSteelBlue},
+   "数值上限"+limit.Value,"Maximum "+limit.Value));
+  return row;
  }
  RoundedButton Button(string chinese,string english){return Bind(new RoundedButton{Height=38,Width=155,
   FillColor=Color.FromArgb(42,69,84),Margin=new Padding(0,0,10,0)},chinese,english);}
@@ -194,14 +251,13 @@ sealed class FeatureForm:Form {
   return card;
  }
  void SetEnabled(bool value){foreach(var control in new Control[]{installRumble,restoreRumble,installDS,restoreDS,installAfterimage,restoreAfterimage,launch,restoreAll,outfit,material,brightness,surfaceBrightness,transparency,pickColor,muscleHighlight,savePreset})control.Enabled=value;}
- void Browse(){using(var dialog=new OpenFileDialog{Title=InstallerLanguage.T("选择游戏 EXE","Select Game EXE"),Filter=InstallerLanguage.T("西格玛1","Ninja Gaiden Sigma")+"|NINJA GAIDEN SIGMA.exe",CheckFileExists=true})if(dialog.ShowDialog(this)==DialogResult.OK){path.Text=Path.GetDirectoryName(dialog.FileName);RefreshState();}}
+ void Browse(){using(var dialog=new OpenFileDialog{Title=InstallerLanguage.T("选择游戏 EXE","Select Game EXE"),Filter=InstallerLanguage.T("西格玛1","Ninja Gaiden Sigma")+"|NINJA GAIDEN SIGMA.exe",CheckFileExists=true})if(dialog.ShowDialog(this)==DialogResult.OK){path.Text=Path.GetDirectoryName(dialog.FileName);RefreshState(logInspection:true);}}
  void SetTint(Color color){tint=color;pickColor.FillColor=color;pickColor.ForeColor=color.GetBrightness()>0.55?Color.Black:Color.White;pickColor.Text=String.Format("#{0:X2}{1:X2}{2:X2}",color.R,color.G,color.B);pickColor.Invalidate();}
  AfterimageMaterial SelectedMaterial {get{return material.SelectedIndex==1?AfterimageMaterial.Sigma2:AfterimageMaterial.Classic;}}
  void RefreshPreset(){
   if(outfit.SelectedIndex<0)return;
   bool showMuscle=AfterimagePreset.ShowsMuscleHighlight(outfit.SelectedIndex);
   bool showSurfaceBrightness=SelectedMaterial==AfterimageMaterial.Sigma2;
-  brightness.Maximum=showSurfaceBrightness?AfterimagePreset.MaxSigma2GlowStrength:100;
   surfaceBrightnessRow.Visible=showSurfaceBrightness;
   visuals.RowStyles[3].Height=showSurfaceBrightness?38:0;
   muscleRow.Visible=showMuscle;
@@ -213,9 +269,10 @@ sealed class FeatureForm:Form {
   muscleHighlight.Value=preset.MuscleHighlight;
   surfaceBrightness.Value=preset.SurfaceBrightness;
  }
- void RefreshState(bool refreshPreset=true){
+ void RefreshState(bool refreshPreset=true,bool logInspection=false){
   bool hasPath=!String.IsNullOrWhiteSpace(path.Text);
   var info=hasPath?engine.Inspect(path.Text):new FeatureInspection();
+  if(hasPath&&logInspection)PatchDiagnostics.Log("inspect",info.CanInstall?"OK":"UNAVAILABLE",path.Text,info.Description);
   if(refreshPreset){
    translating=true;
    try{material.SelectedIndex=info.AfterimageMaterials?(int)engine.LoadMaterial(path.Text):0;}
@@ -229,7 +286,7 @@ sealed class FeatureForm:Form {
   rumbleState.Text=InstallerLanguage.T("震动补丁","Rumble")+InstalledSuffix(info.Rumble);
   dsState.Text=InstallerLanguage.T("PS5 手柄＋自动图标","DualSense + Icons")+InstalledSuffix(info.DualSense);
   afterimageState.Text=InstallerLanguage.T("服装残影","Costume Afterimages")+InstalledSuffix(info.Afterimage);
-  if(info.Afterimage&&info.MaxGlowStrength<AfterimagePreset.MaxSigma2GlowStrength)
+  if(info.Afterimage&&info.MaxClassicGlowStrength<AfterimagePreset.MaxGlowStrength)
    afterimageState.Text+=InstallerLanguage.T(" · 可更新"," · Update available");
   installRumble.Enabled=installDS.Enabled=info.CanInstall;restoreRumble.Enabled=info.Rumble;restoreDS.Enabled=info.DualSense;
   installAfterimage.Enabled=info.CanInstallAfterimage;restoreAfterimage.Enabled=info.Afterimage;
@@ -238,6 +295,27 @@ sealed class FeatureForm:Form {
   restoreAll.Enabled=info.CanRestore;launch.Enabled=hasPath&&(info.CanInstall||File.Exists(Path.Combine(path.Text,Payload.ExeName)));
  }
  static string InstalledSuffix(bool active){return " · "+(active?InstallerLanguage.T("已安装","Installed"):InstallerLanguage.T("未安装","Not installed"));}
- async Task Run(Func<string,string> action){string root=path.Text;SetEnabled(false);browse.Enabled=false;language.Enabled=false;UseWaitCursor=true;try{details.Text=await Task.Run(()=>action(root));}catch(Exception error){details.Text=error.Message;}finally{RefreshState();browse.Enabled=true;language.Enabled=true;UseWaitCursor=false;}}
+ async Task Run(string operation,Func<string,string> action){
+  string root=path.Text;
+  SetEnabled(false);browse.Enabled=language.Enabled=exportDiagnostics.Enabled=false;UseWaitCursor=true;
+  try{details.Text=await Task.Run(()=>PatchDiagnostics.Run(operation,root,()=>action(root)));}
+  catch(Exception error){details.Text=error.Message;}
+  finally{RefreshState();browse.Enabled=language.Enabled=exportDiagnostics.Enabled=true;UseWaitCursor=false;}
+ }
+ async Task ExportDiagnostics(){
+  using(var dialog=new SaveFileDialog{
+   Title=InstallerLanguage.T("保存诊断包","Save diagnostic report"),
+   Filter=InstallerLanguage.T("ZIP 压缩包 (*.zip)|*.zip","ZIP archive (*.zip)|*.zip"),
+   DefaultExt="zip",FileName="NGS1-Diagnostics-"+DateTime.Now.ToString("yyyyMMdd-HHmmss")+".zip"
+  }){
+   if(dialog.ShowDialog(this)!=DialogResult.OK)return;
+   string output=dialog.FileName;
+   await Run("export-diagnostics",root=>{
+    PatchDiagnostics.Export(root,output);
+    return InstallerLanguage.T("诊断包已保存。可以检查 ZIP 内容后手动分享。",
+      "Diagnostic report saved. Review the ZIP before sharing it.");
+   });
+  }
+ }
 }
 }

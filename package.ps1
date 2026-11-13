@@ -8,6 +8,7 @@ $signature=Get-AuthenticodeSignature -LiteralPath $installer
 if($signature.Status -notin @('Valid','NotSigned')){throw ('Invalid installer signature: '+$signature.Status)}
 $info=[ordered]@{product='NGS1RumblePatch';version=$version;core='0.7.5';installerLanguages=@('zh-CN','en');afterimageBase='0.5.9';supportedCoreVersions=@('1.0.0.2-original','1.0.0.2-localized','1.0.0.4-standard','1.0.0.4-aligned');unknownCoreBuildsAccepted=$false;afterimageRequiresVerifiedRenderer=$true;independentInstall=@('rumble','dualsense','afterimage');outfitPresets=5;afterimageMaterials=@('Classic','Sigma2');sigma2MaxBrightness=200;automaticControllerIcons=$true;preservesCustomParameters=$true;createsShortcuts=$false;autoStartAfterInstall=$false;separateLaunchButton=$true;directUpgradeSupported=$true;directExeLaunchSupported=$true;originalUsesPerUserLoginAutoloader=$true;modifiesGameExe=$false;modifiesGameArchive=$false;authenticode=$signature.Status.ToString();installerSHA256=(Get-FileHash -LiteralPath $installer).Hash;embeddedFiles=[ordered]@{}}
 $info.sigma2MaxGlowStrength=200
+$info.classicMaxGlowStrength=200
 foreach($name in @('dinput8.dll','NGS1Rumble.ini','NGS1RumbleRules.ini','NGS1RumbleWaves.ini','NGS1RumbleAuto.exe')){
  $info.embeddedFiles[$name]=(Get-FileHash -LiteralPath (Join-Path $base ('payload\'+$name))).Hash
 }

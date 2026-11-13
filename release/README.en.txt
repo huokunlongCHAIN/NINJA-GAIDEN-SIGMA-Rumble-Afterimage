@@ -1,4 +1,4 @@
-Ninja Gaiden Sigma Enhancements 0.6.9
+Ninja Gaiden Sigma Enhancements 0.6.11
 
 Choose English or 简体中文 in the upper-right corner of the installer. Changes apply immediately, and the installer remembers your selection.
 In windowed mode, rumble and afterimages follow gameplay when the pointer leaves the game window or another window gains focus.
@@ -9,8 +9,11 @@ Installation and restore
 3. Open the game EXE normally or use Launch Game. In compatibility mode, the per-user autoloader takes a few seconds to load the installed features.
 4. Restore All removes the patch runtime and its startup entry. Your game files and saves remain in place.
 
+Installation errors and game crashes
+Reopen the installer, select the affected game EXE, and click Export Diagnostics. Review the ZIP before sharing it with the steps to reproduce the problem. It includes recent installer errors, game version and hashes, available loader and runtime logs, and Windows crash summaries for the selected game. Export replaces the game and Windows user directories with placeholders.
+
 Afterimages
-Choose Classic Material or the refractive sigma2 Material, then choose a costume. Each costume has separate glow strength, color, and transparency settings for each material. Sigma2 surface brightness and glow strength each go up to 200%, doubling the corresponding contribution at 100%. Update the afterimage runtime first to use the new range. Foreground geometry occludes afterimages behind it. Legendary Black Falcon, Legendary Ninja (Blue), and Grip of Murder also offer a muscle highlight control with a default of 45%.
+Choose Classic Material or the refractive sigma2 Material, then choose a costume. Each costume has separate glow strength, color, and transparency settings for each material. Glow strength on both materials and surface brightness on sigma2 go up to 200%, doubling the corresponding contribution at 100%. Update the afterimage runtime first to use the new range. Foreground geometry occludes afterimages behind it. Legendary Black Falcon, Legendary Ninja (Blue), and Grip of Murder also offer a muscle highlight control with a default of 45%.
 Save and Apply Material applies the selected material to all costumes and reloads changes in a running game. Each costume uses its own saved settings. Ctrl+F11 previews the effect and Ctrl+F12 stops the preview.
 
 Supported builds

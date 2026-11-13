@@ -194,6 +194,12 @@ int main() {
         return samples;
     };
     const auto baseline = draw(0);
+    const auto classic100 = draw(100);
+    const auto classic200 = draw(200);
+    const int classicLight100 = int(classic100[0][2]) - int(baseline[0][2]);
+    const int classicLight200 = int(classic200[0][2]) - int(baseline[0][2]);
+    assert(classicLight100 > 0 && std::abs(classicLight200 - 2 * classicLight100) <= 2);
+    printf("Classic emissive contribution at 100%% and 200%%: %d and %d.\n", classicLight100, classicLight200);
     const auto glowing = draw(68);
     const auto fading = draw(68, 0, FadeSteps / 2 - 1);
     const auto anchor = draw(68, 0.20f);
@@ -392,8 +398,10 @@ int main() {
         assert(settings.brightness == 196 + i && settings.glowStrength == 196 + i && settings.alpha == 60 + i);
     }
     assert(WritePrivateProfileStringW(L"Afterimage", L"Material", L"Classic", tempIni));
+    assert(WritePrivateProfileStringW(L"Afterimage.Grip", L"GlowStrengthPercent", L"200", tempIni));
     ReadSettings();
-    assert(!settings.glassVisual && activeCostume == Costume::Grip && settings.alpha == 77);
+    assert(!settings.glassVisual && activeCostume == Costume::Grip && settings.alpha == 77 &&
+        settings.glowStrength == 200);
     assert(DeleteFileW(tempIni));
     puts("Runtime reload switches material and applies the corresponding preset for each outfit.");
     ResetPoses();
