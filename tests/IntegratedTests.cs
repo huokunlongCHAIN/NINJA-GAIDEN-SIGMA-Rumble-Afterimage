@@ -38,32 +38,48 @@ static class IntegratedTests {
    File.WriteAllText(foreign,"localization renderer");
    InstallPrevious(args[1],root,"--install-rumble");
    InstallPrevious(args[1],root,"--install-ps5");
+   InstallPrevious(args[1],root,"--install-afterimage");
    var before=features.Inspect(root);
-   Check(before.Rumble&&before.DualSense&&!before.Afterimage,"0.6.0 flags not loaded correctly.");
+   Check(before.Rumble&&before.DualSense&&before.Afterimage&&before.MaxSurfaceBrightness==100,"Previous feature flags not loaded correctly.");
+   var customClassic=new AfterimagePreset{Brightness=73,Opacity=29,Red=77,Green=88,Blue=99,MuscleHighlight=30};
+   features.SavePreset(root,0,customClassic);
    string rules=Path.Combine(before.ConfigRoot,"NGS1RumbleRules.ini");
    File.AppendAllText(rules,"\r\n; preserved custom rules\r\n");
    string ruleHash=Payload.FileHash(rules);
    features.InstallAfterimage(root);
    var installed=features.Inspect(root);
-   Check(installed.Rumble&&installed.DualSense&&installed.Afterimage,"Afterimage upgrade changed controller features.");
+   Check(installed.Rumble&&installed.DualSense&&installed.Afterimage&&installed.AfterimageMaterials&&
+    installed.MaxSurfaceBrightness==200,"Afterimage upgrade changed controller features or did not raise the brightness limit.");
    Check(FeatureIni.Get(File.ReadAllText(Path.Combine(installed.ConfigRoot,"NGS1Rumble.ini")),
     "Features","AutoIcons","0")=="1","The public installer did not enable built-in DualSense icons.");
    Check(Payload.FileHash(rules)==ruleHash,"Afterimage upgrade changed rumble rules.");
-   Console.WriteLine("PASS: 0.6.0 in-place upgrade preserves independent controller flags and custom rules.");
+   Check(features.LoadMaterial(root)==AfterimageMaterial.Classic&&features.LoadPreset(root,0).Opacity==29,
+    "Upgrade changed the active material or classic settings.");
+   Console.WriteLine("PASS: in-place upgrade preserves controller flags, rumble rules and classic afterimages.");
 
    for(int i=0;i<5;++i){
-    Check(features.LoadPreset(root,i).Opacity==40,"Default preset differs.");
+    Check(features.LoadPreset(root,i,AfterimageMaterial.Sigma2).Opacity==40,"Sigma2 default preset differs.");
     features.SavePreset(root,i,new AfterimagePreset{Brightness=i*25,Opacity=100-i*17,
      MuscleHighlight=20+i*15,Red=245-i,Green=30+i,Blue=15+i});
+    features.SavePreset(root,i,new AfterimagePreset{Brightness=15+i*20,Opacity=35+i*7,
+     SurfaceBrightness=120+i*20,MuscleHighlight=44-i*5,Red=132+i,Green=150+i,Blue=210+i},AfterimageMaterial.Sigma2);
    }
    features.InstallAfterimage(root);
+   Check(features.LoadMaterial(root)==AfterimageMaterial.Sigma2,"The selected material was lost during upgrade.");
    for(int i=0;i<5;++i){
     var preset=features.LoadPreset(root,i);
     Check(preset.Brightness==i*25&&preset.Opacity==100-i*17&&preset.Red==245-i&&preset.Green==30+i&&preset.Blue==15+i,"Preset lost during save or upgrade.");
     bool exposed=i==0||i==2||i==4;
     Check(AfterimagePreset.ShowsMuscleHighlight(i)==exposed&&preset.MuscleHighlight==(exposed?20+i*15:0),"Costume-specific highlight lost or applied incorrectly.");
+    var sigma2=features.LoadPreset(root,i,AfterimageMaterial.Sigma2);
+    Check(sigma2.Brightness==15+i*20&&sigma2.SurfaceBrightness==120+i*20&&sigma2.Opacity==35+i*7&&
+     sigma2.Red==132+i&&sigma2.Green==150+i&&sigma2.Blue==210+i&&sigma2.MuscleHighlight==(exposed?44-i*5:0),
+     "Sigma2 settings were not kept separately for each costume.");
    }
-   Console.WriteLine("PASS: all five independent appearance settings persist through an update.");
+   features.SavePreset(root,0,features.LoadPreset(root,0));
+   Check(features.LoadMaterial(root)==AfterimageMaterial.Classic&&
+    features.LoadPreset(root,0,AfterimageMaterial.Sigma2).SurfaceBrightness==120,"Changing material overwrote the Sigma2 preset.");
+   Console.WriteLine("PASS: both materials keep independent presets for all five costumes.");
 
    features.RestoreRumble(root);
    installed=features.Inspect(root);

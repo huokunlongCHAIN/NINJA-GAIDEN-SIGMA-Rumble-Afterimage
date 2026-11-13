@@ -45,17 +45,18 @@ sealed class FeatureForm:Form {
  readonly List<Action> translatedControls=new List<Action>();
  readonly TextBox path=new TextBox(),details=new TextBox();
  readonly Label status=new Label(),rumbleState=new Label(),dsState=new Label(),afterimageState=new Label();
- readonly ComboBox outfit=new ComboBox();
+ readonly ComboBox outfit=new ComboBox(),material=new ComboBox();
  readonly ComboBox language=new ComboBox();
- readonly NumericUpDown brightness=new NumericUpDown(),transparency=new NumericUpDown(),muscleHighlight=new NumericUpDown();
+ readonly NumericUpDown brightness=new NumericUpDown(),surfaceBrightness=new NumericUpDown(),
+  transparency=new NumericUpDown(),muscleHighlight=new NumericUpDown();
  readonly TableLayoutPanel visuals;
- readonly Control muscleRow;
- Button browse,installRumble,restoreRumble,installDS,restoreDS,installAfterimage,restoreAfterimage,pickColor,savePreset,launch,restoreAll;
+ readonly Control muscleRow,surfaceBrightnessRow;
+ RoundedButton browse,installRumble,restoreRumble,installDS,restoreDS,installAfterimage,restoreAfterimage,pickColor,savePreset,launch,restoreAll;
  Color tint;
  bool translating;
  public FeatureForm(string initial=null){
   Bind(this,"西格玛1 · 功能补丁 "+Payload.Version,"Ninja Gaiden Sigma Enhancements "+Payload.Version);
-  ClientSize=new Size(880,730);MinimumSize=new Size(810,680);StartPosition=FormStartPosition.CenterScreen;Font=new Font("Microsoft YaHei UI",10);BackColor=Color.FromArgb(23,29,38);ForeColor=Color.White;
+  ClientSize=new Size(880,800);MinimumSize=new Size(810,680);StartPosition=FormStartPosition.CenterScreen;Font=new Font("Microsoft YaHei UI",10);BackColor=Color.FromArgb(23,29,38);ForeColor=Color.White;
   var page=new TableLayoutPanel{Dock=DockStyle.Fill,Padding=new Padding(24),ColumnCount=1,RowCount=6};
   foreach(int height in new[]{48,48,48})page.RowStyles.Add(new RowStyle(SizeType.Absolute,height));
   page.RowStyles.Add(new RowStyle(SizeType.Percent,100));
@@ -97,31 +98,41 @@ sealed class FeatureForm:Form {
    "PS5 手柄支持直接输入、热切换和 PS／Xbox 按键图标切换。",
    "DualSense supports direct input, hot switching, and automatic PS/Xbox button icons."),0,2);
   installRumble.Click+=async(s,e)=>await Run(root=>engine.InstallRumble(root));restoreRumble.Click+=async(s,e)=>await Run(root=>engine.RestoreRumble(root));installDS.Click+=async(s,e)=>await Run(root=>engine.InstallDualSense(root));restoreDS.Click+=async(s,e)=>await Run(root=>engine.RestoreDualSense(root));
-  visuals=Section(70,38,38,38,44,38,44);
+  visuals=Section(70,38,38,38,38,38,44,38,44);
   visual.Controls.Add(visuals);
   installAfterimage=Button("安装／更新残影","Install / Update Afterimages");restoreAfterimage=Button("还原残影","Restore Afterimages");
   visuals.Controls.Add(Card(afterimageState,installAfterimage,restoreAfterimage),0,0);
   installAfterimage.Click+=async(s,e)=>await Run(root=>engine.InstallAfterimage(root));
   restoreAfterimage.Click+=async(s,e)=>await Run(root=>engine.RestoreAfterimage(root));
+  material.DropDownStyle=ComboBoxStyle.DropDownList;
+  material.AccessibleName="残影材质 / Afterimage material";
+  material.SelectedIndexChanged+=(s,e)=>{if(!translating)RefreshPreset();};
+  visuals.Controls.Add(Field("材质","Material",material),0,1);
   outfit.DropDownStyle=ComboBoxStyle.DropDownList;
   outfit.SelectedIndexChanged+=(s,e)=>{if(!translating)RefreshPreset();};
-  visuals.Controls.Add(Field("服装","Costume",outfit),0,1);
+  visuals.Controls.Add(Field("服装","Costume",outfit),0,2);
   foreach(var number in new[]{brightness,transparency,muscleHighlight}){number.Minimum=0;number.Maximum=100;}
-  visuals.Controls.Add(Field("发光亮度（%）","Glow brightness (%)",brightness),0,2);
-  visuals.Controls.Add(Field("透明度（%）","Transparency (%)",transparency),0,3);
+  surfaceBrightness.Minimum=0;
+  surfaceBrightness.Maximum=AfterimagePreset.MaxSurfaceBrightness;
+  surfaceBrightnessRow=Field("材质亮度（%）","Surface brightness (%)",surfaceBrightness);
+  visuals.Controls.Add(surfaceBrightnessRow,0,3);
+  visuals.Controls.Add(Field("发光强度（%）","Glow strength (%)",brightness),0,4);
+  visuals.Controls.Add(Field("透明度（%）","Transparency (%)",transparency),0,5);
   pickColor=Button("#90A3FD","#90A3FD");
   pickColor.Click+=(s,e)=>{using(var dialog=new ColorDialog{Color=tint,FullOpen=true})if(dialog.ShowDialog(this)==DialogResult.OK)SetTint(dialog.Color);};
-  visuals.Controls.Add(Field("残影颜色","Afterimage color",pickColor),0,4);
+  visuals.Controls.Add(Field("残影颜色","Afterimage color",pickColor),0,6);
   muscleRow=Field("肌肉高亮程度（%）","Muscle highlight (%)",muscleHighlight);
-  visuals.Controls.Add(muscleRow,0,5);
-  savePreset=Button("保存本套服装设置","Save Costume Settings");savePreset.Width=212;
+  visuals.Controls.Add(muscleRow,0,7);
+  savePreset=Button("保存并应用材质","Save and Apply Material");savePreset.Width=212;
   savePreset.Click+=async(s,e)=>{
    int selected=outfit.SelectedIndex;
-   var preset=new AfterimagePreset{Brightness=(int)brightness.Value,Opacity=100-(int)transparency.Value,
+   var selectedMaterial=SelectedMaterial;
+   var preset=new AfterimagePreset{Brightness=(int)brightness.Value,SurfaceBrightness=(int)surfaceBrightness.Value,
+    Opacity=100-(int)transparency.Value,
     MuscleHighlight=(int)muscleHighlight.Value,Red=tint.R,Green=tint.G,Blue=tint.B};
-   await Run(root=>engine.SavePreset(root,selected,preset));
+   await Run(root=>engine.SavePreset(root,selected,preset,selectedMaterial));
   };
-  visuals.Controls.Add(Field("","",savePreset),0,6);
+  visuals.Controls.Add(Field("","",savePreset),0,8);
   details.Dock=DockStyle.Fill;details.Multiline=true;details.ReadOnly=true;details.ScrollBars=ScrollBars.Vertical;details.BackColor=Color.FromArgb(30,38,50);details.ForeColor=Color.Gainsboro;details.BorderStyle=BorderStyle.None;page.Controls.Add(details,0,4);
   var actions=new FlowLayoutPanel{Dock=DockStyle.Fill,Margin=new Padding(0,8,0,0)};launch=Button("启动游戏","Launch Game");launch.Width=220;launch.Click+=async(s,e)=>await Run(root=>String.Format(InstallerLanguage.T("游戏已启动，进程 {0}","Game launched. Process ID {0}."),engine.Launch(root)));restoreAll=Button("全部还原","Restore All");restoreAll.Width=180;restoreAll.Click+=async(s,e)=>await Run(root=>engine.RestoreAll(root));actions.Controls.Add(launch);actions.Controls.Add(restoreAll);page.Controls.Add(actions,0,5);
   ApplyLanguage();
@@ -139,14 +150,19 @@ sealed class FeatureForm:Form {
  void ApplyLanguage(){
   translating=true;
   int selection=Math.Max(0,outfit.SelectedIndex);
+  int selectedMaterial=Math.Max(0,material.SelectedIndex);
   foreach(var translate in translatedControls)translate();
   outfit.Items.Clear();
   outfit.Items.AddRange(AfterimagePreset.Labels);
   outfit.SelectedIndex=selection;
+  material.Items.Clear();
+  material.Items.AddRange(new object[]{AfterimagePreset.MaterialLabel(AfterimageMaterial.Classic),
+   AfterimagePreset.MaterialLabel(AfterimageMaterial.Sigma2)});
+  material.SelectedIndex=selectedMaterial;
   SetTint(tint.IsEmpty?Color.FromArgb(144,163,253):tint);
   details.Text=InstallerLanguage.T(
-   "各功能可独立安装和还原。安装后可直接打开游戏 EXE。\r\n残影设置保存后，运行中的游戏会自动重载。",
-   "Install and restore each feature separately. Open the game EXE after installing.\r\nAfterimage settings reload automatically when saved.");
+   "各功能可独立安装和还原。安装后可直接打开游戏 EXE。\r\n在「残影」中选择材质和服装，再点击「保存并应用材质」。",
+   "Install and restore each feature separately. Open the game EXE after installing.\r\nIn Afterimages, choose a material and costume, then click Save and Apply Material.");
   translating=false;
  }
  Control Field(string chinese,string english,Control value){
@@ -154,26 +170,51 @@ sealed class FeatureForm:Form {
   row.Controls.Add(Bind(new Label{Width=160,Height=30,TextAlign=ContentAlignment.MiddleLeft},chinese,english));
   value.Width=Math.Max(212,value.Width);row.Controls.Add(value);return row;
  }
- Button Button(string chinese,string english){return Bind(new Button{Height=38,Width=155,FlatStyle=FlatStyle.Flat,BackColor=Color.FromArgb(42,69,84),ForeColor=Color.White,Margin=new Padding(0,0,10,0)},chinese,english);}
- static Control Card(Label state,Button install,Button restore){var card=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=3,Padding=new Padding(12),BackColor=Color.FromArgb(30,39,51),Margin=new Padding(0,0,0,10)};card.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));card.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,235));card.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,175));state.Dock=DockStyle.Fill;state.TextAlign=ContentAlignment.MiddleLeft;card.Controls.Add(state,0,0);install.Dock=restore.Dock=DockStyle.Fill;card.Controls.Add(install,1,0);card.Controls.Add(restore,2,0);return card;}
- void SetEnabled(bool value){foreach(var control in new Control[]{installRumble,restoreRumble,installDS,restoreDS,installAfterimage,restoreAfterimage,launch,restoreAll,outfit,brightness,transparency,pickColor,muscleHighlight,savePreset})control.Enabled=value;}
+ RoundedButton Button(string chinese,string english){return Bind(new RoundedButton{Height=38,Width=155,
+  FillColor=Color.FromArgb(42,69,84),Margin=new Padding(0,0,10,0)},chinese,english);}
+ static Control Card(Label state,Button install,Button restore){
+  var card=new RoundedCard{Dock=DockStyle.Fill,ColumnCount=3,Padding=new Padding(12),
+   FillColor=Color.FromArgb(30,39,51),Margin=new Padding(0,0,0,10)};
+  card.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));
+  card.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,235));
+  card.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,175));
+  state.Dock=DockStyle.Fill;state.TextAlign=ContentAlignment.MiddleLeft;
+  state.BackColor=SystemInformation.HighContrast?SystemColors.Control:card.FillColor;
+  if(SystemInformation.HighContrast)state.ForeColor=SystemColors.ControlText;
+  card.Controls.Add(state,0,0);install.Dock=restore.Dock=DockStyle.Fill;
+  card.Controls.Add(install,1,0);card.Controls.Add(restore,2,0);
+  return card;
+ }
+ void SetEnabled(bool value){foreach(var control in new Control[]{installRumble,restoreRumble,installDS,restoreDS,installAfterimage,restoreAfterimage,launch,restoreAll,outfit,material,brightness,surfaceBrightness,transparency,pickColor,muscleHighlight,savePreset})control.Enabled=value;}
  void Browse(){using(var dialog=new OpenFileDialog{Title=InstallerLanguage.T("选择游戏 EXE","Select Game EXE"),Filter=InstallerLanguage.T("西格玛1","Ninja Gaiden Sigma")+"|NINJA GAIDEN SIGMA.exe",CheckFileExists=true})if(dialog.ShowDialog(this)==DialogResult.OK){path.Text=Path.GetDirectoryName(dialog.FileName);RefreshState();}}
- void SetTint(Color color){tint=color;pickColor.BackColor=color;pickColor.ForeColor=color.GetBrightness()>0.55?Color.Black:Color.White;pickColor.Text=String.Format("#{0:X2}{1:X2}{2:X2}",color.R,color.G,color.B);}
+ void SetTint(Color color){tint=color;pickColor.FillColor=color;pickColor.ForeColor=color.GetBrightness()>0.55?Color.Black:Color.White;pickColor.Text=String.Format("#{0:X2}{1:X2}{2:X2}",color.R,color.G,color.B);pickColor.Invalidate();}
+ AfterimageMaterial SelectedMaterial {get{return material.SelectedIndex==1?AfterimageMaterial.Sigma2:AfterimageMaterial.Classic;}}
  void RefreshPreset(){
   if(outfit.SelectedIndex<0)return;
   bool showMuscle=AfterimagePreset.ShowsMuscleHighlight(outfit.SelectedIndex);
+  bool showSurfaceBrightness=SelectedMaterial==AfterimageMaterial.Sigma2;
+  surfaceBrightnessRow.Visible=showSurfaceBrightness;
+  visuals.RowStyles[3].Height=showSurfaceBrightness?38:0;
   muscleRow.Visible=showMuscle;
-  visuals.RowStyles[5].Height=showMuscle?38:0;
+  visuals.RowStyles[7].Height=showMuscle?38:0;
   var preset=new AfterimagePreset();
-  try{if(!String.IsNullOrWhiteSpace(path.Text))preset=engine.LoadPreset(path.Text,outfit.SelectedIndex);}
+  try{if(!String.IsNullOrWhiteSpace(path.Text))preset=engine.LoadPreset(path.Text,outfit.SelectedIndex,SelectedMaterial);}
   catch(Exception error){details.Text=error.Message;}
   brightness.Value=preset.Brightness;transparency.Value=100-preset.Opacity;SetTint(Color.FromArgb(preset.Red,preset.Green,preset.Blue));
   muscleHighlight.Value=preset.MuscleHighlight;
+  surfaceBrightness.Value=Math.Min(preset.SurfaceBrightness,surfaceBrightness.Maximum);
  }
  void RefreshState(bool refreshPreset=true){
-  if(refreshPreset)RefreshPreset();
   bool hasPath=!String.IsNullOrWhiteSpace(path.Text);
   var info=hasPath?engine.Inspect(path.Text):new FeatureInspection();
+  surfaceBrightness.Maximum=info.MaxSurfaceBrightness;
+  if(refreshPreset){
+   translating=true;
+   try{material.SelectedIndex=info.AfterimageMaterials?(int)engine.LoadMaterial(path.Text):0;}
+   catch(Exception error){material.SelectedIndex=0;details.Text=error.Message;}
+   finally{translating=false;}
+   RefreshPreset();
+  }
   status.Text=hasPath?info.Description:InstallerLanguage.T(
    "请选择游戏。安装、更新或还原功能前，请先正常退出游戏。",
    "Select the game EXE. Exit the game before installing, updating, or restoring features.");
@@ -183,6 +224,7 @@ sealed class FeatureForm:Form {
   installRumble.Enabled=installDS.Enabled=info.CanInstall;restoreRumble.Enabled=info.Rumble;restoreDS.Enabled=info.DualSense;
   installAfterimage.Enabled=info.CanInstallAfterimage;restoreAfterimage.Enabled=info.Afterimage;
   outfit.Enabled=brightness.Enabled=transparency.Enabled=pickColor.Enabled=muscleHighlight.Enabled=savePreset.Enabled=info.Afterimage&&info.CanInstallAfterimage;
+  material.Enabled=surfaceBrightness.Enabled=outfit.Enabled&&info.AfterimageMaterials;
   restoreAll.Enabled=info.CanRestore;launch.Enabled=hasPath&&(info.CanInstall||File.Exists(Path.Combine(path.Text,Payload.ExeName)));
  }
  static string InstalledSuffix(bool active){return " · "+(active?InstallerLanguage.T("已安装","Installed"):InstallerLanguage.T("未安装","Not installed"));}

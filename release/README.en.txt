@@ -1,4 +1,4 @@
-Ninja Gaiden Sigma Enhancements 0.6.6
+Ninja Gaiden Sigma Enhancements 0.6.8
 
 Choose English or 简体中文 in the upper-right corner of the installer. Changes apply immediately, and the installer remembers your selection.
 In windowed mode, rumble and afterimages follow gameplay when the pointer leaves the game window or another window gains focus.
@@ -10,7 +10,8 @@ Installation and restore
 4. Restore All removes the patch runtime and its startup entry. Your game files and saves remain in place.
 
 Afterimages
-Choose a costume and set glow brightness, color, and transparency. Legendary Black Falcon, Legendary Ninja (Blue), and Grip of Murder also offer a muscle highlight control. The default is 45%. Save Costume Settings applies changes to a running game. Ctrl+F11 previews the effect and Ctrl+F12 stops the preview.
+Choose Classic Material or the refractive sigma2 Material, then choose a costume. Each costume has separate glow strength, color, and transparency settings for each material. The sigma2 surface brightness control goes up to 200%. 100% matches the test version. Legendary Black Falcon, Legendary Ninja (Blue), and Grip of Murder also offer a muscle highlight control with a default of 45%.
+Save and Apply Material applies the selected material to all costumes and reloads changes in a running game. Each costume uses its own saved settings. Ctrl+F11 previews the effect and Ctrl+F12 stops the preview.
 
 Supported builds
 The installer verifies known 1.0.0.2 and 1.0.0.4 executables, including the tested 1.0.0.4 Chinese localization by imjinjia. A matching version number alone does not establish compatibility. If verification fails, check the selected EXE and any patches that modify it.

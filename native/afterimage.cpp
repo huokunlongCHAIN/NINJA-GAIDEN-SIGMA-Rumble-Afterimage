@@ -41,6 +41,7 @@ constexpr unsigned CaptureLimit = 320;
 constexpr unsigned FadeSteps = 24;
 constexpr unsigned PoseHistorySize = 12;
 constexpr unsigned MaxGhostLayers = 12;
+constexpr unsigned MaxSurfaceBrightness = 200;
 
 enum Slot : unsigned {
     VsConstants = 7, PsShader = 9, VsShader = 11, Indexed = 12,
@@ -171,6 +172,7 @@ struct RefractionResources {
     std::array<ComPtr<ID3D11Buffer>, 8 * 3> partLabels;
     std::vector<ComPtr<ID3D11RenderTargetView>> slices;
     D3D11_TEXTURE2D_DESC surface{};
+    DXGI_FORMAT maskFormat = DXGI_FORMAT_UNKNOWN;
     bool unavailable = false;
 };
 
@@ -218,6 +220,7 @@ struct Appearance {
     unsigned glow = 68;
     std::array<unsigned, 3> tint{144, 163, 253};
     unsigned muscleHighlight = 45;
+    unsigned brightness = 100;
 };
 
 struct Settings {
@@ -239,6 +242,9 @@ struct Settings {
     unsigned muscleHighlight = 45;
     unsigned refractionPixels = 1;
     unsigned jointOpacity = 76;
+    bool glassVisual = false;
+    unsigned glassRefraction = 19;
+    unsigned brightness = 100;
     std::array<unsigned, 3> tint{144, 163, 253};
 };
 
@@ -1038,6 +1044,7 @@ void ApplyAppearance() {
     settings.glowStrength = appearance.glow;
     settings.tint = appearance.tint;
     settings.muscleHighlight = appearance.muscleHighlight;
+    settings.brightness = appearance.brightness;
 }
 
 const CostumeMesh* ObserveCostume(uint64_t key) {
@@ -1123,7 +1130,9 @@ bool InspectDraw(Context* c, const Draw& draw) {
         const auto surface = activeCostume == Costume::Black ? ClassifyGhostMaterial(key) : mesh->material;
         const bool gripAtlas = surface == GhostMaterial::GripAtlas;
         const float skinBoost = 0.46f * settings.muscleHighlight / 100.0f;
-        const float intensity = settings.alpha * (1.0f + settings.glowStrength / 100.0f) * (1 - body) / 25500.0f;
+        const float materialBrightness = settings.glassVisual ? settings.brightness / 100.0f * 0.48f : 1.0f;
+        const float intensity = settings.alpha * (1.0f + settings.glowStrength / 100.0f) * (1 - body) / 25500.0f *
+            materialBrightness;
         auto setPS = Original<SetPS>(c, PsShader);
         auto drawUnderlay = [&](ID3D11PixelShader* shader, float level) {
             const FLOAT blue[]{settings.tint[0] * intensity * level * 0.70f,
@@ -1223,18 +1232,19 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
             })";
         constexpr char composite[] = R"(
             Texture2D<float4> scene : register(t0);
-            Texture2DArray<float2> parts : register(t1);
+            Texture2DArray<float4> parts : register(t1);
             SamplerState linearSampler : register(s0);
             cbuffer Refraction : register(b12) {
                 float pixels; float time; float emission; float jointOpacity;
                 float4 layerOpacity[3];
                 uint layerCount; uint playerLayer;
-                float muscleHighlight;
+                float muscleHighlight; float glassRefraction;
+                float surfaceBrightness;
             }
             cbuffer GhostColor : register(b13) { float4 color; }
-            float2 surfaceAt(int2 p, uint layer) {
-                float2 raw = parts.Load(int4(p, layer, 0));
-                return float2(round(raw.x * 255.0), raw.y);
+            float4 surfaceAt(int2 p, uint layer) {
+                float4 raw = parts.Load(int4(p, layer, 0));
+                return float4(round(raw.x * 255.0), raw.y, raw.zw * 2.0 - 1.0);
             }
             int partOf(float label) { return (int)label & 15; }
             float filled(float2 surface) { return partOf(surface.x) != 0 ? 1.0 : 0.0; }
@@ -1255,14 +1265,17 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
                 float alpha = 0;
                 float3 light = 0;
                 float3 blue = color.rgb * float3(0.70, 0.83, 1.0);
+                float2 size = float2(w,h);
+                float3 original = scene.Load(int3(pixel, 0)).rgb;
+                float3 glassColor = original;
                 [loop] for (uint i = 0; i < layerCount; ++i) {
-                    float2 surface = surfaceAt(pixel, i);
+                    float4 surface = surfaceAt(pixel, i);
                     int part = partOf(surface.x);
                     if (part == 0) continue;
-                    float2 left = surfaceAt(pixel - int2(width,0), i);
-                    float2 right = surfaceAt(pixel + int2(width,0), i);
-                    float2 top = surfaceAt(pixel - int2(0,width), i);
-                    float2 bottom = surfaceAt(pixel + int2(0,width), i);
+                    float4 left = surfaceAt(pixel - int2(width,0), i);
+                    float4 right = surfaceAt(pixel + int2(width,0), i);
+                    float4 top = surfaceAt(pixel - int2(0,width), i);
+                    float4 bottom = surfaceAt(pixel + int2(0,width), i);
                     float opacity = layerOpacity[i / 4][i % 4];
                     if (jointOpacity < 1 &&
                         (connects(part, partOf(left.x)) || connects(part, partOf(right.x)) ||
@@ -1276,14 +1289,41 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
                     // Reduce coverage at the silhouette, especially at convex
                     // corners. Internal material and anatomical seams stay solid.
                     int2 x = int2(edgeRadius,0), y = int2(0,edgeRadius);
-                    float sides = edgeRadius == width ? filled(left) + filled(right) + filled(top) + filled(bottom) :
-                        filled(surfaceAt(pixel-x,i)) + filled(surfaceAt(pixel+x,i)) +
-                        filled(surfaceAt(pixel-y,i)) + filled(surfaceAt(pixel+y,i));
+                    float sides = edgeRadius == width ? filled(left.xy) + filled(right.xy) + filled(top.xy) + filled(bottom.xy) :
+                        filled(surfaceAt(pixel-x,i).xy) + filled(surfaceAt(pixel+x,i).xy) +
+                        filled(surfaceAt(pixel-y,i).xy) + filled(surfaceAt(pixel+y,i).xy);
                     if (sides < 4) {
-                        float corners = filled(surfaceAt(pixel-x-y,i)) + filled(surfaceAt(pixel+x-y,i)) +
-                            filled(surfaceAt(pixel-x+y,i)) + filled(surfaceAt(pixel+x+y,i));
+                        float corners = filled(surfaceAt(pixel-x-y,i).xy) + filled(surfaceAt(pixel+x-y,i).xy) +
+                            filled(surfaceAt(pixel-x+y,i).xy) + filled(surfaceAt(pixel+x+y,i).xy);
                         float edge = (4.0 + 2.0 * sides + corners) / 16.0;
                         opacity *= lerp(0.35, 1.0, smoothstep(0.20, 0.98, edge));
+                    }
+                    if (glassRefraction >= 0) {
+                        // The shape bends the scene behind it. A weak lavender
+                        // tint remains where the angle gives little refraction.
+                        float4 normalWeights = float4(filled(left.xy), filled(right.xy),
+                            filled(top.xy), filled(bottom.xy));
+                        float2 direction = (surface.zw * 3 + left.zw * normalWeights.x + right.zw * normalWeights.y +
+                            top.zw * normalWeights.z + bottom.zw * normalWeights.w) /
+                            (3 + dot(normalWeights, float4(1,1,1,1)));
+                        float bend = saturate(length(direction));
+                        float rim = saturate((4 - sides) * 0.25);
+                        float2 shifted = clamp(pos.xy - direction * glassRefraction * (h / 720.0),
+                            float2(0.5,0.5), size - 0.5);
+                        int2 source = int2(floor(shifted - 0.5));
+                        bool touchesPlayer = playerAt(source) || playerAt(source + int2(1,0)) ||
+                            playerAt(source + int2(0,1)) || playerAt(source + int2(1,1));
+                        float3 bent = touchesPlayer ? original : scene.SampleLevel(linearSampler, shifted / size, 0).rgb;
+                        float transmission = saturate(opacity * (1.35 + 1.18 * bend));
+                        glassColor = lerp(glassColor, bent, transmission);
+                        float3 lavender = lerp(color.rgb, float3(0.64, 0.59, 0.84), 0.47);
+                        float frost = opacity * (0.16 + 0.30 * (1 - bend) + 0.22 * rim);
+                        float skin = ((int)surface.x >> 4) == 2 ? muscleHighlight : 0.25;
+                        float glint = opacity * emission * (0.11 + 0.32 * rim + 0.24 * bend * bend + 0.14 * brightness * skin);
+                        glassColor = glassColor * (1 - frost) + lavender * frost * 0.70 * surfaceBrightness +
+                            lerp(lavender, float3(0.91,0.90,1.0), 0.37 * bend) * glint;
+                        alpha += opacity;
+                        continue;
                     }
                     float coverage = opacity * (0.44 + 0.48 * brightness);
                     float highlight = ((int)surface.x >> 4) == 2 ? muscleHighlight : 1.0;
@@ -1293,9 +1333,8 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
                     alpha = coverage + alpha * (1 - coverage);
                 }
                 if (alpha <= 0) discard;
-                float3 original = scene.Load(int3(pixel, 0)).rgb;
+                if (glassRefraction >= 0) return float4(glassColor, 1);
                 if (pixels <= 0) return float4(original * (1 - alpha) + light, 1);
-                float2 size = float2(w,h);
                 float2 p = pos.xy * (720.0 / h);
                 float2 wave = float2(sin(p.y * 0.055 + time), cos(p.x * 0.05 - time));
                 float2 shift = wave * (pixels * max(0.5, h / 720.0));
@@ -1311,20 +1350,20 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
         constexpr char partLighting[] = R"(
             cbuffer Part : register(b11) { float id; float minimum; float range; }
             cbuffer Viewport : register(b12) { float invHeight; }
-            float2 surface(float4 pos, float label, float low, float span) {
+            float4 surface(float4 pos, float label, float low, float span) {
                 float z = rcp(max(abs(pos.w), 0.0001));
                 float3 normal = normalize(float3(-ddx(z), ddy(z), z * invHeight * 1.1));
                 float diffuse = pow(saturate(dot(normal, float3(-0.42, 0.44, 0.794))), 1.35);
                 float grazing = 1.0 - normal.z;
                 float level = saturate(low + span * (diffuse * 0.76 + grazing * 0.24));
-                return float2(label / 255.0, level);
+                return float4(label / 255.0, level, normal.xy * 0.5 + 0.5);
             })";
         const std::string part = std::string(partLighting) + R"(
-            float2 main(float4 pos : SV_Position) : SV_Target { return surface(pos, id, minimum, range); }
+            float4 main(float4 pos : SV_Position) : SV_Target { return surface(pos, id, minimum, range); }
         )";
         // Only the finger and palm islands of albedo 21 contain skin.
         const std::string glove = std::string(partLighting) + R"(
-            float2 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+            float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
                 uv = frac(uv);
                 bool fingers = uv.x < 0.5 && uv.y < 0.5 && (uv.x >= 0.25 || uv.y >= 0.25);
                 bool thumb = uv.x >= 0.875 && uv.y < 0.125;
@@ -1333,7 +1372,7 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
             }
         )";
         const std::string grip = std::string(partLighting) + GripSkinMask + R"(
-            float2 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+            float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
                 bool skin = gripSkin(uv);
                 return surface(pos, skin ? id + 16 : id, skin ? 0.72 : minimum, skin ? 0.28 : range);
             }
@@ -1355,7 +1394,7 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
             if (FAILED(device->CreateBuffer(&labels, &initial, res.partLabels[i].GetAddressOf()))) return false;
         }
         D3D11_BUFFER_DESC parameters{};
-        parameters.ByteWidth = 16 + MaxGhostLayers * 4 + 16;
+        parameters.ByteWidth = 16 + MaxGhostLayers * 4 + 32;
         parameters.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         D3D11_DEPTH_STENCIL_DESC depth{};
         depth.DepthEnable = TRUE;
@@ -1379,7 +1418,8 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
     }
     const bool sameSize = res.scene && res.surface.Width == backBuffer.Width &&
         res.surface.Height == backBuffer.Height && res.surface.Format == backBuffer.Format;
-    if (sameSize && res.slices.size() >= layers) return true;
+    const DXGI_FORMAT maskFormat = settings.glassVisual ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8G8_UNORM;
+    if (sameSize && res.maskFormat == maskFormat && res.slices.size() >= layers) return true;
     auto desc = backBuffer;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -1388,7 +1428,7 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
     ComPtr<ID3D11ShaderResourceView> sceneView, maskView;
     if (!sameSize && (FAILED(device->CreateTexture2D(&desc, nullptr, scene.GetAddressOf())) ||
         FAILED(device->CreateShaderResourceView(scene.Get(), nullptr, sceneView.GetAddressOf())))) return false;
-    desc.Format = DXGI_FORMAT_R8G8_UNORM;
+    desc.Format = maskFormat;
     desc.ArraySize = layers;
     desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
     D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -1414,6 +1454,7 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
     }
     res.slices = std::move(slices);
     res.maskView = std::move(maskView);
+    res.maskFormat = maskFormat;
     return true;
 }
 
@@ -1434,11 +1475,15 @@ void CompositeRefraction(Context* c, DeviceResources& res, ID3D11RenderTargetVie
         float pixels, time, emission, jointOpacity;
         std::array<float, MaxGhostLayers> opacities;
         UINT layers, playerLayer;
-        float muscleHighlight, padding = 0;
+        float muscleHighlight, glassRefraction;
+        float surfaceBrightness;
+        float padding[3];
     };
     const Parameters constants{float(settings.refractionPixels), float(GetTickCount64() % 8000) * 0.0007853982f,
         settings.glowStrength / 100.0f, settings.jointOpacity / 100.0f, opacities, layers,
-        playerFront ? layers : UINT_MAX, settings.muscleHighlight / 100.0f};
+        playerFront ? layers : UINT_MAX, settings.muscleHighlight / 100.0f,
+        settings.glassVisual ? float(settings.glassRefraction) : -1.0f,
+        settings.brightness / 100.0f, {}};
     c->UpdateSubresource(refraction.parameters.Get(), 0, nullptr, &constants, 0, 0);
     ID3D11Buffer* buffers[]{refraction.parameters.Get(), res.colors.back().Get()};
     Original<SetBuffers>(c, PsConstants)(c, ColorSlot - 1, 2, buffers);
@@ -1584,10 +1629,12 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
     if (FAILED(Original<FinishList>(c, Finish)(c, FALSE, list.GetAddressOf())) || !list) return false;
     Original<ExecuteList>(immediate.Get(), Execute)(immediate.Get(), list.Get(), TRUE);
     if (loggedOverlays++ < 16)
-        Log("OVERLAY_DRAW frame=%llu draws=%u poses=%u backbuffer=%ux%u emission=%u refraction=%u segmented=%u player_front=%u",
+        Log("OVERLAY_DRAW frame=%llu draws=%u poses=%u backbuffer=%ux%u emission=%u refraction=%u segmented=%u player_front=%u style=%s",
             static_cast<unsigned long long>(renderFrame), static_cast<unsigned>(draws.size()), poses, desc.Width,
-            desc.Height, settings.glowStrength, useRefraction ? settings.refractionPixels : 0, unsigned(useRefraction),
-            playerFront ? res.playerFront.count : 0);
+            desc.Height, settings.glowStrength,
+            useRefraction ? (settings.glassVisual ? settings.glassRefraction : settings.refractionPixels) : 0,
+            unsigned(useRefraction), playerFront ? res.playerFront.count : 0,
+            settings.glassVisual ? "Sigma2" : "Classic");
     return true;
 }
 
@@ -1754,7 +1801,12 @@ unsigned ReadNumber(const wchar_t* name, unsigned fallback, unsigned low, unsign
 void ReadSettings() {
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
     const bool previouslyEnabled = settings.enabled;
-    const Appearance previous{settings.alpha, settings.glowStrength, settings.tint, settings.muscleHighlight};
+    const bool previousMaterial = settings.glassVisual;
+    const Appearance previous{settings.alpha, settings.glowStrength, settings.tint, settings.muscleHighlight,
+        settings.brightness};
+    wchar_t material[24]{};
+    GetPrivateProfileStringW(L"Afterimage", L"Material", L"Classic", material, std::size(material), ini.c_str());
+    settings.glassVisual = _wcsicmp(material, L"Sigma2") == 0;
     settings.enabled = ReadNumber(L"Enabled", 1, 0, 1) != 0;
     settings.autoET = ReadNumber(L"AutomaticDragonET", 1, 0, 1) != 0;
     settings.autoUT = ReadNumber(L"AutomaticDragonUT", 1, 0, 1) != 0;
@@ -1769,25 +1821,37 @@ void ReadSettings() {
     settings.revealFrames = ReadNumber(L"RevealFrames", 9, 1, 45);
     settings.utRevealFrames = ReadNumber(L"UTRevealFrames", 12, 1, 45);
     settings.refractionPixels = ReadNumber(L"RefractionPixels", 1, 0, 8);
+    settings.glassRefraction = ReadNumber(L"GlassRefractionPixels", 19, 0, 36);
     settings.jointOpacity = ReadNumber(L"JointOpacityPercent", 76, 0, 100);
     for (unsigned i = 0; i < appearances.size(); ++i) {
-        auto read = [&](const wchar_t* key, unsigned fallback, unsigned maximum) {
-            const auto value = static_cast<int>(GetPrivateProfileIntW(Costumes[i].section, key, fallback, ini.c_str()));
-            return static_cast<unsigned>(std::clamp(value, 0, static_cast<int>(maximum)));
-        };
         const auto costume = static_cast<Costume>(i);
         const bool exposedSkin = costume == Costume::Black || costume == Costume::Blue || costume == Costume::Grip;
-        appearances[i] = {read(L"OpacityPercent", 40, 100), read(L"GlowStrengthPercent", 68, 100),
-            {read(L"TintR", 144, 255), read(L"TintG", 163, 255), read(L"TintB", 253, 255)},
-            exposedSkin ? read(L"MuscleHighlightPercent", 45, 100) : 0};
+        auto load = [&](const wchar_t* section) -> Appearance {
+            auto read = [&](const wchar_t* key, unsigned fallback, unsigned maximum) {
+                const auto value = static_cast<int>(GetPrivateProfileIntW(section, key, fallback, ini.c_str()));
+                return static_cast<unsigned>(std::clamp(value, 0, static_cast<int>(maximum)));
+            };
+            return {read(L"OpacityPercent", 40, 100), read(L"GlowStrengthPercent", 68, 100),
+                {read(L"TintR", 144, 255), read(L"TintG", 163, 255), read(L"TintB", 253, 255)},
+                exposedSkin ? read(L"MuscleHighlightPercent", 45, 100) : 0,
+                read(L"SurfaceBrightnessPercent", 100, MaxSurfaceBrightness)};
+        };
+        if (settings.glassVisual) {
+            const auto section = std::wstring(L"Afterimage.Sigma2") + wcschr(Costumes[i].section, L'.');
+            appearances[i] = load(section.c_str());
+        } else {
+            appearances[i] = load(Costumes[i].section);
+        }
     }
     ApplyAppearance();
+    if (previousMaterial != settings.glassVisual)
+        Log("MATERIAL_RELOAD %s", settings.glassVisual ? "Sigma2" : "Classic");
     if (activeCostume != Costume::Unknown && (previous.alpha != settings.alpha ||
         previous.glow != settings.glowStrength || previous.tint != settings.tint ||
-        previous.muscleHighlight != settings.muscleHighlight)) {
-        Log("APPEARANCE_RELOAD costume=%u alpha=%u glow=%u rgb=%u,%u,%u muscle=%u",
+        previous.muscleHighlight != settings.muscleHighlight || previous.brightness != settings.brightness)) {
+        Log("APPEARANCE_RELOAD costume=%u alpha=%u glow=%u rgb=%u,%u,%u muscle=%u brightness=%u",
             unsigned(activeCostume), settings.alpha, settings.glowStrength, settings.tint[0], settings.tint[1],
-            settings.tint[2], settings.muscleHighlight);
+            settings.tint[2], settings.muscleHighlight, settings.brightness);
     }
     if (previouslyEnabled != settings.enabled) {
         ResetPoses();
@@ -1874,12 +1938,13 @@ bool StartAfterimage(const wchar_t* root, GameCompatibility::Kind kind, Controll
     logFile = _wfsopen((directory + L"\\NGS1Afterimage.log").c_str(), L"wb", _SH_DENYNO);
     gameBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     controllerHooks = shared;
-    Log("GAME pid=%lu build=%s afterimage=0.6.6", GetCurrentProcessId(), GameCompatibility::Name(kind));
+    Log("GAME pid=%lu build=%s afterimage=0.6.8", GetCurrentProcessId(), GameCompatibility::Name(kind));
     if (GetModuleHandleW(L"NGS1Afterimage.dll")) {
         Log("LEGACY_AFTERIMAGE_ALREADY_LOADED");
         return false;
     }
     ReadSettings();
+    Log("VISUAL_STYLE %s", settings.glassVisual ? "Sigma2" : "Classic");
     if (kind == GameCompatibility::Kind::Unsupported || !InstallHooks(kind)) {
         Log("INITIALIZATION_FAILED");
         return false;

@@ -10,7 +10,7 @@
 
 右上角可即时切换简体中文和 English，安装器会记住上次选择。安装包附有中英文使用说明。
 
-每套服装可单独保存残影亮度、颜色和透明度。默认黑衣、蓝色传说忍者服和杀戮凶手额外提供肌肉高亮调节，默认 45%。保存后游戏自动重载。0.6.3 为残影轮廓加入转角柔化，并沿用游戏的原始服装网格。
+「残影」页提供「原版材质」和带有透景折射的「sigma2 材质」。两种材质在五套服装上各自保存发光强度、颜色和透明度。「sigma2 材质」的材质亮度可调至 200%。默认黑衣、蓝色传说忍者服和杀戮凶手提供肌肉高亮调节，默认 45%。点击「保存并应用材质」后，游戏自动重载。
 
 ## 从源码构建
 
@@ -22,6 +22,8 @@ pwsh -File .\package.ps1
 ```
 
 安装器生成在 `release/NGS1RumblePatch.exe`。`-RunRenderTests` 会运行 D3D11 WARP 渲染测试和动作时序测试。安装器集成测试另外接受临时目录、上一版安装器和用于检查的本地游戏 EXE 路径。
+
+如已有 Windows 信任的代码签名证书，可用 `build.ps1 -SigningCertificateThumbprint <证书指纹>` 签名。构建需要 Windows SDK 的 SignTool，可用 `-SignToolPath` 指定。脚本会先签名 DLL 和自动加载器，再将它们嵌入安装器并签名。打包脚本记录签名状态与 SHA-256。
 
 默认构建包括 DualSense 输入、震动与内置 PS／Xbox 图标切换。图标在运行时绘制。需要自定义样式时，可以用自己有权使用的原版与 PS 图标 GT1G 容器生成本地头文件，然后用 `build.ps1 -IconHeader <路径>` 构建。两套容器的文件名为 `02771.GT1G0600` 和 `02777.GT1G0600`。
 
@@ -39,3 +41,5 @@ This Windows mod adds configurable afterimages for five Ryu costumes, controller
 Download the ZIP from Releases, exit the game, and run `NGS1RumblePatch.exe`. Choose **English** in the upper-right corner. Select the game EXE and install the features you want. You can then start the game normally.
 
 The public package supports verified 1.0.0.2 and 1.0.0.4 builds, including the tested 1.0.0.4 Chinese localization. Installing DualSense support also enables automatic PlayStation/Xbox button icons. The source build commands above use PowerShell 7 and x64 LLVM with MinGW.
+
+The Afterimages tab offers Classic and refractive sigma2 materials, with separate glow strength, color and transparency settings for all five costumes. Sigma2 surface brightness can reach 200%. **Save and Apply Material** reloads the appearance in a running game.

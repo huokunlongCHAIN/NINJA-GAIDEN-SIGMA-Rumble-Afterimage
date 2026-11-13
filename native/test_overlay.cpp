@@ -5,6 +5,7 @@
 // Match the state at presentation: opaque scene props have already filled the target.
 int main() {
     logFile = stdout;
+    settings.glassVisual = false;
     constexpr UINT Size = 128;
     const HWND window = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, Size, Size, nullptr, nullptr, nullptr, nullptr);
     assert(window);
@@ -98,6 +99,7 @@ int main() {
     assert(SUCCEEDED(device->CreateTexture2D(&image, nullptr, readback.GetAddressOf())));
     ComPtr<ID3D11DeviceContext1> context1;
     assert(SUCCEEDED(immediate.As(&context1)));
+    ComPtr<ID3D11VertexShader> curvedShader;
     auto draw = [&](unsigned strength, float anchorOpacity = 0, unsigned fadeStep = FadeSteps - 1,
         unsigned distortion = 0, bool seam = false, bool playerFront = false,
         GhostMaterial material = GhostMaterial::Fabric) {
@@ -116,7 +118,8 @@ int main() {
         packet.color = res.colors[fadeStep];
         packet.opacity = anchorOpacity > 0 ? anchorOpacity : 0.48f * (fadeStep + 1) / FadeSteps;
         packet.material = material;
-        packet.shader = material == GhostMaterial::GripAtlas ? gripVertex : defaultVertex;
+        packet.shader = settings.glassVisual ? curvedShader :
+            (material == GhostMaterial::GripAtlas ? gripVertex : defaultVertex);
         res.overlayDraws = {packet, packet};
         if (seam) {
             res.overlayDraws[0].pose.vertices[0] = left;
@@ -140,13 +143,15 @@ int main() {
         D3D11_MAPPED_SUBRESOURCE mapped{};
         assert(SUCCEEDED(immediate->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped)));
         const auto* pixels = static_cast<const BYTE*>(mapped.pData);
-        std::array<std::array<BYTE, 4>, 6> samples{};
+        std::array<std::array<BYTE, 4>, 8> samples{};
         const UINT rows[]{64, 115, 117, 125};
         for (unsigned i = 0; i < 4; ++i)
             std::copy_n(pixels + rows[i] * mapped.RowPitch + 64 * 4, 4, samples[i].begin());
         std::copy_n(pixels + 64 * mapped.RowPitch + 84 * 4, 4, samples[4].begin());
         std::copy_n(pixels + 114 * mapped.RowPitch + 64 * 4, 4, samples[5].begin());
-        if (distortion && !playerFront) {
+        std::copy_n(pixels + 64 * mapped.RowPitch + 55 * 4, 4, samples[6].begin());
+        std::copy_n(pixels + 64 * mapped.RowPitch + 63 * 4, 4, samples[7].begin());
+        if (distortion && !playerFront && !settings.glassVisual) {
             // Black tint makes any red outside the stripe attributable to displaced scene sampling.
             bool displaced = false;
             for (unsigned y = 55; y < 88; ++y) {
@@ -163,14 +168,14 @@ int main() {
                 row[64 * 4] == joint);
             printf("Anatomical opacity: part interior red %u, joint red %u.\n", inner, joint);
         }
-        if (playerFront && distortion) {
+        if (playerFront && distortion && !settings.glassVisual) {
             // The refracted sample cannot pull pixels from the live silhouette.
             for (unsigned y = 55; y < 88; ++y) {
                 const auto* row = pixels + y * mapped.RowPitch;
                 assert(row[63 * 4] == 0 && row[64 * 4] == 255);
             }
             puts("Refraction did not sample the front character into the background.");
-        } else if (playerFront) {
+        } else if (playerFront && !settings.glassVisual) {
             const auto* row = pixels + 64 * mapped.RowPitch;
             const std::array<BYTE, 4> liveColor{0, 255, 0, 84};
             assert(std::equal(liveColor.begin(), liveColor.end(), row + 64 * 4));
@@ -360,8 +365,29 @@ int main() {
     assert(WritePrivateProfileStringW(L"Afterimage.Grip", L"OpacityPercent", L"77", tempIni));
     ReadSettings();
     assert(activeCostume == Costume::Grip && settings.alpha == 77);
+    assert(WritePrivateProfileStringW(L"Afterimage", L"Material", L"Sigma2", tempIni));
+    const wchar_t* sigma2Sections[]{L"Afterimage.Sigma2.Black", L"Afterimage.Sigma2.Purple",
+        L"Afterimage.Sigma2.Blue", L"Afterimage.Sigma2.Ashtar", L"Afterimage.Sigma2.Grip"};
+    for (unsigned i = 0; i < std::size(Costumes); ++i) {
+        assert(WritePrivateProfileStringW(sigma2Sections[i], L"SurfaceBrightnessPercent",
+            std::to_wstring(196 + i).c_str(), tempIni));
+        assert(WritePrivateProfileStringW(sigma2Sections[i], L"GlowStrengthPercent",
+            std::to_wstring(50 + i).c_str(), tempIni));
+        assert(WritePrivateProfileStringW(sigma2Sections[i], L"OpacityPercent",
+            std::to_wstring(60 + i).c_str(), tempIni));
+    }
+    ReadSettings();
+    assert(settings.glassVisual && settings.alpha == 64 && settings.brightness == 200);
+    for (unsigned i = 0; i < std::size(Costumes); ++i) {
+        activeCostume = static_cast<Costume>(i);
+        ApplyAppearance();
+        assert(settings.brightness == 196 + i && settings.glowStrength == 50 + i && settings.alpha == 60 + i);
+    }
+    assert(WritePrivateProfileStringW(L"Afterimage", L"Material", L"Classic", tempIni));
+    ReadSettings();
+    assert(!settings.glassVisual && activeCostume == Costume::Grip && settings.alpha == 77);
     assert(DeleteFileW(tempIni));
-    puts("Runtime reload applies only the active outfit's changed preset.");
+    puts("Runtime reload switches material and applies the corresponding preset for each outfit.");
     ResetPoses();
     airCombo = {};
     DWORD foregroundOwner = 0;
@@ -380,6 +406,45 @@ int main() {
     ObservePresent(swap.Get(), 0, 0);
     assert(loggedOverlays == beforeBackgroundPresent + 1);
     puts("The hooked Present composites a saved pose without foreground focus.");
+
+    const char* curvedVertex = R"(
+        float4 main(float2 p : POSITION) : SV_Position {
+            float w = 1.0 - 0.55 * p.x;
+            return float4(p * w, 0.5 * w, w);
+        }
+    )";
+    assert(SUCCEEDED(D3DCompile(curvedVertex, strlen(curvedVertex), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0,
+        code.ReleaseAndGetAddressOf(), nullptr)));
+    assert(SUCCEEDED(device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr,
+        curvedShader.GetAddressOf())));
+    settings.glassVisual = true;
+    settings.glassRefraction = 0;
+    const auto transparent = draw(0, 0, FadeSteps - 1, 1);
+    settings.glassRefraction = 36;
+    const auto glass = draw(0, 0, FadeSteps - 1, 1);
+    printf("Glass scene green %u -> %u, red stripe displaced %u -> %u.\n",
+        transparent[0][1], glass[0][1], transparent[6][0], glass[6][0]);
+    fflush(stdout);
+    assert(glass[0][1] > 100 && transparent[0][1] > 180);
+    assert(transparent[6][0] < 65 && glass[6][0] > transparent[6][0] + 60);
+    const auto protectedPlayer = draw(0, 0, FadeSteps - 1, 1, false, true);
+    const std::array<BYTE, 4> frontStripe{255, 0, 0, prop[3]};
+    assert(protectedPlayer[0] == frontStripe && protectedPlayer[7][0] < 65);
+    settings.brightness = 0;
+    const auto dark = draw(0);
+    settings.brightness = 100;
+    const auto bright = draw(0);
+    const auto emissive = draw(100);
+    settings.brightness = 200;
+    const auto brighter = draw(0);
+    assert(bright[4][2] > dark[4][2] && emissive[4][2] > bright[4][2] && brighter[4][2] > bright[4][2]);
+    const auto disabledGlass = draw(0, 0, FadeSteps - 1, 0);
+    assert(disabledGlass[1] == prop && disabledGlass[2] == prop && disabledGlass[3] == prop);
+    assert(res.refraction.maskFormat == DXGI_FORMAT_R8G8B8A8_UNORM);
+    settings.glassVisual = false;
+    draw(0);
+    assert(res.refraction.maskFormat == DXGI_FORMAT_R8G8_UNORM);
+    puts("Glass style preserves background detail, bends it along the surface, and protects the live silhouette.");
     hooksReady = false;
     MH_Uninitialize();
     DestroyWindow(window);

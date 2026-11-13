@@ -1,12 +1,26 @@
 param(
  [string]$ClangDirectory,
  [string]$IconHeader,
+ [string]$SigningCertificateThumbprint,
+ [string]$SignToolPath,
+ [string]$TimestampUrl='http://timestamp.digicert.com',
  [switch]$RunRenderTests
 )
 $ErrorActionPreference='Stop'
 $base=$PSScriptRoot
 $build=Join-Path $base 'build'
 New-Item -ItemType Directory -Force -Path $build,(Join-Path $base 'release') | Out-Null
+if($SigningCertificateThumbprint){
+ if($SigningCertificateThumbprint -notmatch '^[0-9a-fA-F]{40}$'){throw 'Provide a valid certificate thumbprint.'}
+ if(!$SignToolPath){$SignToolPath=(Get-Command signtool.exe -ErrorAction Stop).Source}
+}
+function Sign-PatchBinary([string]$Path){
+ if(!$SigningCertificateThumbprint){return}
+ & $SignToolPath sign /sha1 $SigningCertificateThumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $Path
+ if($LASTEXITCODE -ne 0){throw ('Authenticode signing failed for '+$Path)}
+ & $SignToolPath verify /pa /tw $Path
+ if($LASTEXITCODE -ne 0){throw ('Authenticode verification failed for '+$Path)}
+}
 if(!$ClangDirectory){$ClangDirectory=Split-Path (Get-Command clang++.exe -ErrorAction Stop).Source}
 $compiler=Join-Path $ClangDirectory 'clang++.exe'
 $cCompiler=Join-Path $ClangDirectory 'clang.exe'
@@ -26,6 +40,7 @@ if($IconHeader){
 }
 & $compiler '-std=c++17' '-O2' '-s' '-shared' '-static' '-Wall' '-Wextra' '-Wno-unused-parameter' '-I' $minhook @icons (Join-Path $base 'native\rumble.cpp') (Join-Path $base 'native\afterimage.cpp') (Join-Path $base 'native\dinput8.def') @objects '-lbcrypt' '-luser32' '-lhid' '-lsetupapi' '-ldxguid' '-ld3dcompiler' '-o' (Join-Path $base 'payload\dinput8.dll')
 if($LASTEXITCODE -ne 0){throw 'Integrated core build failed'}
+Sign-PatchBinary (Join-Path $base 'payload\dinput8.dll')
 if($RunRenderTests){
  & $compiler '-std=c++17' '-O2' '-static' '-I' $minhook (Join-Path $base 'native\test_overlay.cpp') @objects '-ld3dcompiler' '-ld3d11' '-lbcrypt' '-luser32' '-ldxguid' '-o' (Join-Path $build 'test_overlay.exe')
  if($LASTEXITCODE -ne 0){throw 'Render test build failed'}
@@ -51,16 +66,27 @@ $csc='C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $common=@('/nologo','/platform:x64','/optimize+','/reference:System.Core.dll','/reference:System.Web.Extensions.dll')
 $payloadSource=[IO.File]::ReadAllText((Join-Path $base 'src\Payload.cs'))
 $version=[regex]::Match($payloadSource,'Version="([^"]+)"').Groups[1].Value
+$metadataPath=Join-Path $build 'InstallerAssemblyInfo.cs'
+$metadata=@"
+using System.Reflection;
+[assembly: AssemblyTitle("Ninja Gaiden Sigma Enhancements")]
+[assembly: AssemblyProduct("Ninja Gaiden Sigma Enhancements")]
+[assembly: AssemblyCompany("huokunlongCHAIN")]
+[assembly: AssemblyVersion("$version.0")]
+[assembly: AssemblyFileVersion("$version.0")]
+"@
+[IO.File]::WriteAllText($metadataPath,$metadata,[Text.UTF8Encoding]::new($false))
 $autoSource='namespace NgsRumblePatch { public static class AutoLoaderConstants { public const string Version="'+$version+'"; public const string CoreHash="'+$coreHash+'"; } }'
 [IO.File]::WriteAllText((Join-Path $base 'build\AutoLoaderConstants.cs'),$autoSource,[Text.UTF8Encoding]::new($false))
 $inputRows=@('AutoLoader.cs','GameCompatibility.cs','RuntimeBridge.cs','InstallerLanguage.cs') | ForEach-Object {$_+':'+(Get-FileHash -LiteralPath (Join-Path $base ('src\'+$_))).Hash}
-$inputRows+=@('Version:'+$version,'CoreHash:'+$coreHash,'Compiler:'+(Get-FileHash -LiteralPath $csc).Hash)
+$inputRows+=@('Version:'+$version,'CoreHash:'+$coreHash,'Compiler:'+(Get-FileHash -LiteralPath $csc).Hash,'Signer:'+$SigningCertificateThumbprint)
 $sha=[Security.Cryptography.SHA256]::Create();try{$inputHash=[BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($inputRows -join "`n")))).Replace('-','')}finally{$sha.Dispose()}
 $cachePath=Join-Path $base 'build\autoloader-build.json';$autoPath=Join-Path $base 'payload\NGS1RumbleAuto.exe';$reuse=$false
 if((Test-Path -LiteralPath $cachePath) -and (Test-Path -LiteralPath $autoPath)){$cache=Get-Content -LiteralPath $cachePath -Raw -Encoding utf8|ConvertFrom-Json;$reuse=$cache.inputHash -eq $inputHash -and $cache.binaryHash -eq (Get-FileHash -LiteralPath $autoPath).Hash}
 if(!$reuse){
  & $csc @common '/target:winexe' ('/out:'+$autoPath) (Join-Path $base 'src\AutoLoader.cs') (Join-Path $base 'src\GameCompatibility.cs') (Join-Path $base 'src\RuntimeBridge.cs') (Join-Path $base 'src\InstallerLanguage.cs') (Join-Path $base 'build\AutoLoaderConstants.cs')
  if($LASTEXITCODE -ne 0){throw 'Autoloader build failed'}
+ Sign-PatchBinary $autoPath
  @{inputHash=$inputHash;binaryHash=(Get-FileHash -LiteralPath $autoPath).Hash}|ConvertTo-Json|Set-Content -LiteralPath $cachePath -Encoding utf8
 }
 $hashRows=@()
@@ -75,8 +101,10 @@ $common=@('/nologo','/platform:x64','/optimize+','/reference:System.Core.dll','/
 $resources=@()
 foreach($name in @('dinput8.dll','NGS1Rumble.ini','NGS1RumbleRules.ini','NGS1RumbleWaves.ini','NGS1RumbleAuto.exe')){$resources+=('/resource:'+(Join-Path $base ('payload\'+$name))+',Payload.'+$name)}
 $engineSources=@('Payload.cs','PatchEngine.cs','GameCompatibility.cs','Launcher.cs','CleanUninstall.cs','RuntimeBridge.cs','AutoLifecycle.cs','Features.cs','InstallerLanguage.cs') | ForEach-Object {Join-Path $base ('src\'+$_)}
-& $csc @common '/target:winexe' '/reference:System.Windows.Forms.dll' '/reference:System.Drawing.dll' ('/out:'+(Join-Path $base 'release\NGS1RumblePatch.exe')) @engineSources (Join-Path $base 'src\InstallerSession.cs') (Join-Path $base 'src\Program.cs') (Join-Path $base 'build\PayloadHashes.cs') (Join-Path $base 'build\ReleasedCoreHashes.cs') @resources
+$installer=Join-Path $base 'release\NGS1RumblePatch.exe'
+& $csc @common '/target:winexe' '/reference:System.Windows.Forms.dll' '/reference:System.Drawing.dll' ('/out:'+$installer) @engineSources (Join-Path $base 'src\InstallerSession.cs') (Join-Path $base 'src\Program.cs') (Join-Path $base 'src\RoundedControls.cs') $metadataPath (Join-Path $base 'build\PayloadHashes.cs') (Join-Path $base 'build\ReleasedCoreHashes.cs') @resources
 if($LASTEXITCODE -ne 0){throw 'Installer build failed'}
+Sign-PatchBinary $installer
 if(Test-Path -LiteralPath (Join-Path $base 'tests\InstallerTests.cs')){
  & $csc @common '/target:exe' ('/out:'+(Join-Path $base 'build\InstallerTests.exe')) @engineSources (Join-Path $base 'tests\InstallerTests.cs') (Join-Path $base 'build\PayloadHashes.cs') (Join-Path $base 'build\ReleasedCoreHashes.cs') @resources
  if($LASTEXITCODE -ne 0){throw 'Installer tests build failed'}
