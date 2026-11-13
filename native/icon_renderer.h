@@ -5,15 +5,13 @@
 #include <mutex>
 #include <atomic>
 #include "MinHook.h"
+#include "controller_glyphs.h"
 #ifdef NGS1_LOCAL_ICONS
 #include "icon_data.generated.h"
-#else
-static constexpr unsigned char kControllerIconData[]{0};
 #endif
 #include "render_hook_bridge.h"
 
 namespace ControllerIcons {
-inline constexpr bool HasIconData = sizeof(kControllerIconData) >= 16;
 struct Run {uint32_t offset;std::vector<BYTE> bytes;};
 struct Patch {uint32_t width,height,size;uint64_t xbox,ps;std::vector<Run> runs;};
 struct Pair {ID3D11ShaderResourceView* xbox;ID3D11ShaderResourceView* ps;ID3D11Texture2D* texture=nullptr;std::vector<BYTE> xboxPixels,psPixels;UINT pitch=0;int applied=0;bool mutableTexture=false;};
@@ -41,6 +39,7 @@ template<class T>inline T Original(ID3D11DeviceContext* context,unsigned index){
 template<class T>struct Ref {T* p=nullptr;~Ref(){if(p)p->Release();}T** out(){return &p;}T* operator->(){return p;}};
 inline uint64_t Hash(const BYTE* data,size_t size){uint64_t h=14695981039346656037ull;for(size_t i=0;i<size;++i)h=(h^data[i])*1099511628211ull;return h;}
 inline bool Parse(){
+#ifdef NGS1_LOCAL_ICONS
  const BYTE* cursor=kControllerIconData,*end=cursor+sizeof(kControllerIconData);
  auto read=[&](void* out,size_t n){if(size_t(end-cursor)<n)return false;memcpy(out,cursor,n);cursor+=n;return true;};
  char magic[8];uint32_t version,count;if(!read(magic,8)||memcmp(magic,"NGSICN02",8)||!read(&version,4)||version!=1||!read(&count,4)||count>16)return false;
@@ -48,6 +47,23 @@ inline bool Parse(){
   if(!read(&p.width,4)||!read(&p.height,4)||!read(&p.xbox,8)||!read(&p.ps,8)||!read(&p.size,4)||!read(&runs,4)||p.width!=512||(p.height!=32&&p.height!=512)||p.size!=p.width*p.height*4||runs>10000)return false;
   uint32_t last=0;for(uint32_t n=0;n<runs;++n){Run r{};uint32_t length;if(!read(&r.offset,4)||!read(&length,4)||r.offset<last||length>p.size||r.offset>p.size-length)return false;r.bytes.resize(length);if(!read(r.bytes.data(),length))return false;last=r.offset+length;p.runs.push_back(std::move(r));}patches.push_back(std::move(p));
  }return cursor==end;
+#else
+ return true;
+#endif
+}
+
+inline bool MakeAlternate(std::vector<BYTE>& pixels,unsigned width,unsigned height,bool& wasPS,bool& generated){
+ const uint64_t hash=Hash(pixels.data(),pixels.size());
+ for(const auto& patch:patches){
+  if(patch.width!=width||patch.height!=height||(patch.xbox!=hash&&patch.ps!=hash))continue;
+  wasPS=patch.ps==hash;
+  for(const auto& run:patch.runs)
+   for(size_t i=0;i<run.bytes.size();++i)pixels[run.offset+i]^=run.bytes[i];
+  return Hash(pixels.data(),pixels.size())==(wasPS?patch.xbox:patch.ps);
+ }
+ wasPS=false;
+ generated=ControllerGlyphs::IsXboxAtlas(width,height,hash)&&ControllerGlyphs::Render(pixels,width,height);
+ return generated;
 }
 inline Pair* Find(ID3D11DeviceContext* context,ID3D11ShaderResourceView* view){
  if(!view)return nullptr;auto known=views.find(view);if(known!=views.end())return &pairs[known->second];if(pairs.size()>=64)return nullptr;
@@ -63,19 +79,21 @@ inline Pair* Find(ID3D11DeviceContext* context,ID3D11ShaderResourceView* view){
  Ref<ID3D11Texture2D> staging;if(FAILED(device->CreateTexture2D(&stagingDesc,nullptr,staging.out())))return nullptr;
  context->CopyResource(staging.p,texture.p);D3D11_MAPPED_SUBRESOURCE mapped{};if(FAILED(context->Map(staging.p,0,D3D11_MAP_READ,0,&mapped)))return nullptr;
  std::vector<BYTE> pixels(size_t(desc.Width)*desc.Height*4);for(UINT row=0;row<desc.Height;++row)memcpy(pixels.data()+size_t(row)*desc.Width*4,static_cast<BYTE*>(mapped.pData)+size_t(row)*mapped.RowPitch,desc.Width*4);context->Unmap(staging.p,0);
- uint64_t hash=Hash(pixels.data(),pixels.size());const Patch* match=nullptr;bool wasPS=false;
- for(const auto& p:patches)if(p.width==desc.Width&&p.height==desc.Height&&(p.xbox==hash||p.ps==hash)){match=&p;wasPS=p.ps==hash;break;}
- if(!match){static unsigned misses=0;if(log&&misses++<8)log("ICON_CANDIDATE_UNMATCHED width=%u height=%u format=%u hash=%llx",desc.Width,desc.Height,desc.Format,static_cast<unsigned long long>(hash));marker=1;texture->SetPrivateData(tag,4,&marker);return nullptr;}
  std::vector<BYTE> source=pixels;
- for(const auto& r:match->runs)for(size_t i=0;i<r.bytes.size();++i)pixels[r.offset+i]^=r.bytes[i];
- if(Hash(pixels.data(),pixels.size())!=(wasPS?match->xbox:match->ps))return nullptr;
- if(desc.Usage==D3D11_USAGE_DEFAULT){Pair pair{};pair.xbox=pair.ps=view;view->AddRef();pair.texture=texture.p;pair.texture->AddRef();pair.mutableTexture=true;pair.pitch=desc.Width*4;pair.applied=wasPS?1:0;pair.xboxPixels=wasPS?pixels:source;pair.psPixels=wasPS?source:pixels;size_t index=pairs.size();pairs.push_back(std::move(pair));views[view]=index;textures[texture.p]=index;if(log)log("ICON_TEXTURE_MATCH width=%u height=%u format=%u source=%s mutable=1",desc.Width,desc.Height,desc.Format,wasPS?"PS":"Xbox");return &pairs[index];}
+ bool wasPS=false,generated=false;
+ if(!MakeAlternate(pixels,desc.Width,desc.Height,wasPS,generated)){
+  static unsigned misses=0;
+  if(log&&misses++<8)log("ICON_CANDIDATE_UNMATCHED width=%u height=%u format=%u hash=%llx",desc.Width,desc.Height,
+   desc.Format,static_cast<unsigned long long>(Hash(source.data(),source.size())));
+  marker=1;texture->SetPrivateData(tag,4,&marker);return nullptr;
+ }
+ if(desc.Usage==D3D11_USAGE_DEFAULT){Pair pair{};pair.xbox=pair.ps=view;view->AddRef();pair.texture=texture.p;pair.texture->AddRef();pair.mutableTexture=true;pair.pitch=desc.Width*4;pair.applied=wasPS?1:0;pair.xboxPixels=wasPS?pixels:source;pair.psPixels=wasPS?source:pixels;size_t index=pairs.size();pairs.push_back(std::move(pair));views[view]=index;textures[texture.p]=index;if(log)log("ICON_TEXTURE_MATCH width=%u height=%u format=%u source=%s mutable=1 generated=%u",desc.Width,desc.Height,desc.Format,wasPS?"PS":"Xbox",generated);return &pairs[index];}
  D3D11_TEXTURE2D_DESC otherDesc=desc;otherDesc.Usage=D3D11_USAGE_IMMUTABLE;otherDesc.BindFlags=D3D11_BIND_SHADER_RESOURCE;otherDesc.CPUAccessFlags=0;otherDesc.MiscFlags=0;
  D3D11_SUBRESOURCE_DATA initial{pixels.data(),desc.Width*4,0};Ref<ID3D11Texture2D> other;
  if(FAILED(device->CreateTexture2D(&otherDesc,&initial,other.out())))return nullptr;
  ID3D11ShaderResourceView* otherView=nullptr;if(FAILED(device->CreateShaderResourceView(other.p,&srvDesc,&otherView)))return nullptr;
  view->AddRef();Pair pair{};pair.xbox=wasPS?otherView:view;pair.ps=wasPS?view:otherView;size_t index=pairs.size();pairs.push_back(std::move(pair));views[pairs[index].xbox]=index;views[pairs[index].ps]=index;
- if(log)log("ICON_TEXTURE_MATCH width=%u height=%u format=%u source=%s pairs=%u",desc.Width,desc.Height,desc.Format,wasPS?"PS":"Xbox",unsigned(pairs.size()));return &pairs[index];
+ if(log)log("ICON_TEXTURE_MATCH width=%u height=%u format=%u source=%s pairs=%u generated=%u",desc.Width,desc.Height,desc.Format,wasPS?"PS":"Xbox",unsigned(pairs.size()),generated);return &pairs[index];
 }
 inline void Sync(ID3D11DeviceContext* context){if(context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return;std::lock_guard<std::recursive_mutex> guard(lock);
  auto queue=std::move(pending);pending.clear();for(auto view:queue){try{Find(context,view);}catch(...){}view->Release();}
@@ -133,7 +151,7 @@ inline bool Initialize(void(*logger)(const char*,...)){
  for(auto target:targets)if(MH_QueueEnableHook(target)!=MH_OK)return rollback();
  enabled=true;
  if(MH_ApplyQueued()!=MH_OK)return rollback();
- if(log)log("ICON_RENDERER_READY variants=%u",unsigned(patches.size()));return true;
+ if(log)log("ICON_RENDERER_READY builtin=1 custom_variants=%u",unsigned(patches.size()));return true;
 }
 inline void Select(bool ps){bool old=desiredPS.exchange(ps);if(old!=ps&&log)log("ICON_MODE target=%s",ps?"PS":"Xbox");}
 }

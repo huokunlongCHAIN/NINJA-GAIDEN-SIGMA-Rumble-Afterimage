@@ -46,6 +46,8 @@ static class IntegratedTests {
    features.InstallAfterimage(root);
    var installed=features.Inspect(root);
    Check(installed.Rumble&&installed.DualSense&&installed.Afterimage,"Afterimage upgrade changed controller features.");
+   Check(FeatureIni.Get(File.ReadAllText(Path.Combine(installed.ConfigRoot,"NGS1Rumble.ini")),
+    "Features","AutoIcons","0")=="1","The public installer did not enable built-in DualSense icons.");
    Check(Payload.FileHash(rules)==ruleHash,"Afterimage upgrade changed rumble rules.");
    Console.WriteLine("PASS: 0.6.0 in-place upgrade preserves independent controller flags and custom rules.");
 

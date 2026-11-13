@@ -53,7 +53,6 @@ sealed class FeatureForm:Form {
  Button browse,installRumble,restoreRumble,installDS,restoreDS,installAfterimage,restoreAfterimage,pickColor,savePreset,launch,restoreAll;
  Color tint;
  bool translating;
- static readonly bool IncludesIcons=PayloadHashes.HasIconData;
  public FeatureForm(string initial=null){
   Bind(this,"西格玛1 · 功能补丁 "+Payload.Version,"Ninja Gaiden Sigma Enhancements "+Payload.Version);
   ClientSize=new Size(880,730);MinimumSize=new Size(810,680);StartPosition=FormStartPosition.CenterScreen;Font=new Font("Microsoft YaHei UI",10);BackColor=Color.FromArgb(23,29,38);ForeColor=Color.White;
@@ -95,9 +94,8 @@ sealed class FeatureForm:Form {
   controllerPage.Controls.Add(Card(rumbleState,installRumble,restoreRumble),0,0);
   controllerPage.Controls.Add(Card(dsState,installDS,restoreDS),0,1);
   controllerPage.Controls.Add(Bind(new Label{Dock=DockStyle.Fill,ForeColor=Color.Silver},
-   IncludesIcons?"PS5 手柄支持直接输入、热切换和 PS／Xbox 按键图标切换。":"PS5 手柄支持直接输入和热切换。图标切换可随本地图标数据构建。",
-   IncludesIcons?"DualSense supports direct input, hot switching, and automatic PS/Xbox button icons.":
-   "DualSense supports direct input and hot switching. Icon switching requires a build with local icon data."),0,2);
+   "PS5 手柄支持直接输入、热切换和 PS／Xbox 按键图标切换。",
+   "DualSense supports direct input, hot switching, and automatic PS/Xbox button icons."),0,2);
   installRumble.Click+=async(s,e)=>await Run(root=>engine.InstallRumble(root));restoreRumble.Click+=async(s,e)=>await Run(root=>engine.RestoreRumble(root));installDS.Click+=async(s,e)=>await Run(root=>engine.InstallDualSense(root));restoreDS.Click+=async(s,e)=>await Run(root=>engine.RestoreDualSense(root));
   visuals=Section(70,38,38,38,44,38,44);
   visual.Controls.Add(visuals);
@@ -180,8 +178,7 @@ sealed class FeatureForm:Form {
    "请选择游戏。安装、更新或还原功能前，请先正常退出游戏。",
    "Select the game EXE. Exit the game before installing, updating, or restoring features.");
   rumbleState.Text=InstallerLanguage.T("震动补丁","Rumble")+InstalledSuffix(info.Rumble);
-  dsState.Text=(IncludesIcons?InstallerLanguage.T("PS5 手柄＋自动图标","DualSense + Icons"):
-   InstallerLanguage.T("PS5 手柄","DualSense"))+InstalledSuffix(info.DualSense);
+  dsState.Text=InstallerLanguage.T("PS5 手柄＋自动图标","DualSense + Icons")+InstalledSuffix(info.DualSense);
   afterimageState.Text=InstallerLanguage.T("服装残影","Costume Afterimages")+InstalledSuffix(info.Afterimage);
   installRumble.Enabled=installDS.Enabled=info.CanInstall;restoreRumble.Enabled=info.Rumble;restoreDS.Enabled=info.DualSense;
   installAfterimage.Enabled=info.CanInstallAfterimage;restoreAfterimage.Enabled=info.Afterimage;

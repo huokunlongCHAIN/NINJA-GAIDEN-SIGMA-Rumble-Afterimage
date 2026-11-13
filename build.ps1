@@ -35,6 +35,10 @@ if($RunRenderTests){
  if($LASTEXITCODE -ne 0){throw 'Charge test build failed'}
  & (Join-Path $build 'test_charge_effect.exe')
  if($LASTEXITCODE -ne 0){throw 'Charge tests failed'}
+ & $compiler '-std=c++17' '-O2' '-static' (Join-Path $base 'native\test_controller_glyphs.cpp') '-o' (Join-Path $build 'test_controller_glyphs.exe')
+ if($LASTEXITCODE -ne 0){throw 'Controller glyph test build failed'}
+ & (Join-Path $build 'test_controller_glyphs.exe')
+ if($LASTEXITCODE -ne 0){throw 'Controller glyph tests failed'}
 }
 $historyPath=Join-Path $base 'release-core-history.json'
 $history=@()
@@ -64,8 +68,7 @@ foreach($name in @('dinput8.dll','NGS1Rumble.ini','NGS1RumbleRules.ini','NGS1Rum
  $hash=(Get-FileHash -LiteralPath (Join-Path $base ('payload\'+$name))).Hash
  $hashRows+=('  {"'+$name+'","'+$hash+'"},')
 }
-$hasIcons=if($IconHeader){'true'}else{'false'}
-$hashSource="using System.Collections.Generic;`r`nnamespace NgsRumblePatch { public static class PayloadHashes { public const bool HasIconData=$hasIcons; public static readonly Dictionary<string,string> Values=new Dictionary<string,string>{`r`n"+($hashRows -join "`r`n")+"`r`n}; } }"
+$hashSource="using System.Collections.Generic;`r`nnamespace NgsRumblePatch { public static class PayloadHashes { public static readonly Dictionary<string,string> Values=new Dictionary<string,string>{`r`n"+($hashRows -join "`r`n")+"`r`n}; } }"
 [IO.File]::WriteAllText((Join-Path $base 'build\PayloadHashes.cs'),$hashSource,[Text.UTF8Encoding]::new($false))
 $csc='C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $common=@('/nologo','/platform:x64','/optimize+','/reference:System.Core.dll','/reference:System.Web.Extensions.dll')

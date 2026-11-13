@@ -619,7 +619,7 @@ static DWORD WINAPI Worker(void*) {
                time.wYear,time.wMonth,time.wDay,time.wHour,time.wMinute,time.wSecond,GetCurrentProcessId());
     swprintf_s(iniPath, L"%s\\NGS1Rumble.ini", root);
     logFile = _wfsopen(logPath, L"wb", _SH_DENYNO); if (!logFile) return 0;
-    Print("NGS1 Modular Controller Core 0.7.4 pid=%lu", GetCurrentProcessId());
+    Print("NGS1 Modular Controller Core 0.7.5 pid=%lu", GetCurrentProcessId());
     wchar_t executable[MAX_PATH]; GetModuleFileNameW(nullptr, executable, MAX_PATH);
     char hash[65]{}; bool hashOk = HashFile(executable, hash);
     Print("exe_sha256=%s", hashOk ? hash : "READ_ERROR");
@@ -710,7 +710,7 @@ static DWORD WINAPI Worker(void*) {
     bool getHook = PatchIAT(0x91C900, reinterpret_cast<void*>(ObserveGet), reinterpret_cast<void*>(realGetState));
     bool setHook = PatchIAT(0x91C8F8, reinterpret_cast<void*>(ObserveSet), reinterpret_cast<void*>(realSetState));
     dualSenseEnabled=wantDualSense;
-    autoIcons=dualSenseEnabled&&ControllerIcons::HasIconData&&GetPrivateProfileIntW(L"Features",L"AutoIcons",1,iniPath)!=0;
+    autoIcons=dualSenseEnabled&&GetPrivateProfileIntW(L"Features",L"AutoIcons",1,iniPath)!=0;
     preferDualSense=GetPrivateProfileIntW(L"DualSense",L"PreferDualSense",1,iniPath)!=0;
     bool capsHook=PatchIAT(0x91C908,reinterpret_cast<void*>(ObserveCapabilities),reinterpret_cast<void*>(realCapabilities));
     if(!getHook||!setHook||!capsHook)dualSenseEnabled=false;
