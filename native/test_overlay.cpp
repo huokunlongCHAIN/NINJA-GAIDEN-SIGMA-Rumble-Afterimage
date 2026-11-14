@@ -1,6 +1,82 @@
 #include "afterimage.cpp"
 #include <cassert>
 #include <d3d11_1.h>
+#include <d3dcompiler.h>
+
+namespace {
+struct FakeContext { void** table; };
+using ClearEntry = void (STDMETHODCALLTYPE*)(FakeContext*, void*, UINT, FLOAT, UINT8);
+std::array<void*, 54> immediateTable{}, deferredTable{};
+std::array<RenderVtable::Slot, 2> clearSlots{};
+unsigned forwardedClears = 0;
+unsigned observedClears = 0;
+unsigned recoveredCycles = 0;
+bool recurseThroughTable = false;
+bool forwardViaOtherTable = false;
+
+void STDMETHODCALLTYPE FinishClear(FakeContext*, void* view, UINT flags, FLOAT depth, UINT8 stencil) {
+    assert(view == &clearSlots && flags == D3D11_CLEAR_DEPTH && depth == 0.5f && stencil == 7);
+    ++forwardedClears;
+}
+
+void STDMETHODCALLTYPE ForwardClear(FakeContext* c, void* view, UINT flags, FLOAT depth, UINT8 stencil) {
+    if (recurseThroughTable) {
+        recurseThroughTable = false;
+        reinterpret_cast<ClearEntry>(c->table[53])(c, view, flags, depth, stencil);
+    } else if (forwardViaOtherTable) {
+        forwardViaOtherTable = false;
+        reinterpret_cast<ClearEntry>(deferredTable[53])(c, view, flags, depth, stencil);
+    } else {
+        FinishClear(c, view, flags, depth, stencil);
+    }
+}
+
+void ObserveTestClear(ClearEntry next, FakeContext* c, void* view, UINT flags, FLOAT depth, UINT8 stencil) {
+    ++observedClears;
+    next(c, view, flags, depth, stencil);
+}
+
+void LogCycle(const char*, ...) { ++recoveredCycles; }
+
+bool STDMETHODCALLTYPE TestGameDrawPreparation(void* renderer, int topology) {
+    auto* context = *reinterpret_cast<Context* const*>(static_cast<const BYTE*>(renderer) + GameContextOffset);
+    const D3D11_VIEWPORT viewport{0, 0, 128, 128, 0, 1};
+    context->RSSetViewports(1, &viewport);
+    return topology == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+}
+
+void STDMETHODCALLTYPE AlternateViewport(Context* c, UINT, const D3D11_VIEWPORT*) {
+    assert(contexts.at(c).viewportCount == 1);
+}
+
+void CheckClearForwarding() {
+    using Observer = RenderVtable::Observer<ClearEntry, ObserveTestClear>;
+    immediateTable[53] = reinterpret_cast<void*>(ForwardClear);
+    deferredTable[53] = reinterpret_cast<void*>(FinishClear);
+    clearSlots = {{
+        {immediateTable.data() + 53, immediateTable[53], reinterpret_cast<void*>(Observer::Call<clearSlots, 0>), 53, LogCycle},
+        {deferredTable.data() + 53, deferredTable[53], reinterpret_cast<void*>(Observer::Call<clearSlots, 1>), 53, LogCycle},
+    }};
+    for (const auto& slot : clearSlots) assert(slot.Exchange(slot.original, slot.observer));
+    FakeContext context{immediateTable.data()};
+    const auto clear = [&] {
+        reinterpret_cast<ClearEntry>(context.table[53])(&context, &clearSlots, D3D11_CLEAR_DEPTH, 0.5f, 7);
+    };
+    // An entry forwards through the other table while preserving the original 'this'.
+    forwardViaOtherTable = true;
+    clear();
+    assert(forwardedClears == 1 && observedClears == 2 && recoveredCycles == 0);
+    // A cycle through the same slot restores it once and leaves the other table hooked.
+    recurseThroughTable = true;
+    clear();
+    assert(forwardedClears == 2 && observedClears == 3 && recoveredCycles == 1);
+    clear();
+    assert(forwardedClears == 3 && observedClears == 3 && recoveredCycles == 1);
+    assert(immediateTable[53] == clearSlots[0].original && deferredTable[53] == clearSlots[1].observer);
+    assert(clearSlots[1].Restore());
+    puts("ClearDepthStencilView forwarding and cycle recovery passed.");
+}
+}
 
 // Match the state at presentation: opaque scene props have already filled the target.
 int main() {
@@ -32,6 +108,14 @@ int main() {
     immediate->ClearRenderTargetView(propTarget.Get(), propColor);
     swap->Present(0, 0);
 
+    // The title has already created its recording context by the time it loads the patch.
+    ComPtr<Context> deferred;
+    assert(SUCCEEDED(device->CreateDeferredContext(0, deferred.GetAddressOf())));
+    alignas(void*) std::array<BYTE, GameContextOffset + sizeof(Context*)> worker{};
+    auto* workerData = worker.data();
+    auto* workerContext = deferred.Get();
+    memcpy(worker.data() + GameContextOffset, &workerContext, sizeof(workerContext));
+
     assert(MH_Initialize() == MH_OK);
     alignas(void*) std::array<BYTE, 0x3088> renderer{};
     auto* liveSwap = swap.Get();
@@ -40,9 +124,44 @@ int main() {
     memcpy(renderer.data() + 0x3080, &liveSwap, sizeof(liveSwap));
     memcpy(renderer.data() + 0x3078, &liveDevice, sizeof(liveDevice));
     memcpy(renderer.data() + 0x10, &liveContext, sizeof(liveContext));
+    memcpy(renderer.data() + RendererWorkerOffset, &workerData, sizeof(workerData));
     originalGameFrame = [](void*, void*) {};
+    gameWorkerLayoutVerified = true;
     ObserveGameFrame(renderer.data(), nullptr);
     assert(hooksReady && gameSwap == liveSwap);
+    CheckClearForwarding();
+    assert(RenderVtable::Table(immediate.Get())[ClearDepthView] !=
+        reinterpret_cast<void*>(Original<ClearDepth>(immediate.Get(), ClearDepthView)));
+
+    ComPtr<ID3D11CommandList> commandList;
+    const D3D11_VIEWPORT testViewport{0, 0, float(Size), float(Size), 0, 1};
+    deferred->RSSetViewports(1, &testViewport);
+    assert(contexts.at(deferred.Get()).viewportCount == 1);
+    assert(SUCCEEDED(deferred->FinishCommandList(FALSE, commandList.GetAddressOf())));
+    assert(contexts.at(deferred.Get()).viewportCount == 0);
+    puts("The pre-existing game worker context is observed through the verified renderer layout.");
+    originalPrepareGameDraw = TestGameDrawPreparation;
+    assert(ObservePrepareGameDraw(worker.data(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST));
+    auto** table = RenderVtable::Table(deferred.Get());
+    auto* observedViewport = table[Viewports];
+    const auto& slot = *originals.at(table + Viewports);
+    std::atomic<void*> dispatch{reinterpret_cast<void*>(TestGameDrawPreparation)};
+    void* testSlot = reinterpret_cast<void*>(AlternateViewport);
+    std::atomic<bool> retired{false};
+    const RenderVtable::Slot replacement{&testSlot, reinterpret_cast<void*>(TestGameDrawPreparation),
+        observedViewport, Viewports, nullptr, &retired, &dispatch};
+    assert(RebindContextSlot(replacement));
+    assert(replacement.Next() == reinterpret_cast<void*>(AlternateViewport) && testSlot == observedViewport);
+    assert(replacement.Restore());
+    assert(slot.Restore());
+    assert(ObservePrepareGameDraw(worker.data(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST));
+    assert(table[Viewports] == observedViewport);
+    puts("Game draw preparation restores a replaced observer and tracks runtime entry changes.");
+    immediate->RSSetViewports(1, &testViewport);
+    immediate->ExecuteCommandList(commandList.Get(), TRUE);
+    assert(contexts.at(immediate.Get()).viewportCount == 1);
+    immediate->ExecuteCommandList(commandList.Get(), FALSE);
+    assert(contexts.at(immediate.Get()).viewportCount == 0);
 
     auto& res = resources[device.Get()];
     assert(PrepareGhost(device.Get(), res));
@@ -105,6 +224,7 @@ int main() {
     auto draw = [&](unsigned strength, float anchorOpacity = 0, unsigned fadeStep = FadeSteps - 1,
         unsigned distortion = 0, bool seam = false, bool playerFront = false,
         GhostMaterial material = GhostMaterial::Fabric) {
+        ObserveGameFrame(renderer.data(), nullptr);
         settings.glowStrength = strength;
         settings.refractionPixels = distortion;
         immediate->ClearRenderTargetView(propTarget.Get(), propColor);
@@ -118,8 +238,10 @@ int main() {
         if (obstacle) {
             const D3D11_VIEWPORT viewport{0, 0, float(Size), float(Size), 0, 1};
             RememberSceneDepth(device.Get(), res.sceneDepth, obstacle.Get(), nullptr, viewport);
-            if (clearObstacleBeforePresent)
+            if (clearObstacleBeforePresent) {
+                ObserveGameFrame(renderer.data(), nullptr);
                 immediate->ClearDepthStencilView(obstacle.Get(), D3D11_CLEAR_DEPTH, 1, 0);
+            }
         }
         packet.pose.renderFrame = renderFrame;
         packet.anchorOpacity = anchorOpacity;
@@ -419,7 +541,7 @@ int main() {
     res.nextTrail = 1;
     res.cameraFrame = renderFrame;
     const unsigned beforeBackgroundPresent = loggedOverlays;
-    ObservePresent(swap.Get(), 0, 0);
+    swap->Present(0, 0);
     assert(loggedOverlays == beforeBackgroundPresent + 1);
     puts("The hooked Present composites a saved pose without foreground focus.");
 
@@ -494,9 +616,29 @@ int main() {
         clearObstacleBeforePresent = false;
         immediate->CopyResource(depthTexture.Get(), splitScene.Get());
     }
+    intelAdapter = true;
+    assert(!SceneDepthEnabled());
+    const auto withoutDepthCopy = draw(100);
+    assert(withoutDepthCopy[6] != prop && withoutDepthCopy[0] != prop);
+    settings.sceneDepthMode = 2;
+    const auto forcedDepth = draw(100);
+    assert(forcedDepth[6] == prop && forcedDepth[0] != prop);
+    settings.sceneDepthMode = 0;
+    ComPtr<Context> intelPath;
+    assert(SUCCEEDED(device->CreateDeferredContext(0, intelPath.GetAddressOf())));
+    auto** intelTable = RenderVtable::Table(intelPath.Get());
+    assert(!originals.count(intelTable + ClearDepthView));
+    assert(originals.count(intelTable + Indexed));
+    intelAdapter = false;
+    puts("Intel automatic mode leaves the depth-clear slot untouched and retains indexed drawing observation.");
     puts("Both materials hide the part of a pose behind scene depth, including depth cleared before Present.");
     puts("Glass style preserves background detail, bends it along the surface, and protects the live silhouette.");
     hooksReady = false;
+    assert(deviceEntries[0].Restore());
+    assert(presentEntries[0].Restore());
+    for (const auto& entry : contextEntries)
+        if (entry.address && *entry.address == entry.observer) assert(entry.Restore());
+    for (auto& owner : contextTableOwners) owner.Reset();
     MH_Uninitialize();
     DestroyWindow(window);
 }

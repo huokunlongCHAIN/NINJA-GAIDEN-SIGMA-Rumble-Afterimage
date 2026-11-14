@@ -92,7 +92,21 @@ public sealed class PatchEngine {
  internal static void AtomicWrite(string path,byte[] bytes){
   string temp=Path.Combine(Path.GetDirectoryName(path),".ngsr-"+Guid.NewGuid().ToString("N").Substring(0,12)+".tmp");
   using(var stream=new FileStream(temp,FileMode.CreateNew,FileAccess.Write,FileShare.None))stream.Write(bytes,0,bytes.Length);
-  try{if(File.Exists(path))File.Replace(temp,path,null);else File.Move(temp,path);}
+  try{
+   for(int delay=50;;delay*=2){
+    try{
+     if(File.Exists(path))File.Replace(temp,path,null);else File.Move(temp,path);
+     return;
+    }catch(IOException error){
+     // These errors leave the destination in place. A short-lived reader may still hold it.
+     bool sharing=error.HResult==unchecked((int)0x80070020)||error.HResult==unchecked((int)0x80070021)||
+      error.HResult==unchecked((int)0x80070497);
+     if(!sharing||delay>400||!File.Exists(path)||!File.Exists(temp))
+      throw new IOException(Path.GetFileName(path)+" - "+error.Message,error.HResult);
+     Thread.Sleep(delay);
+    }
+   }
+  }
   finally{if(File.Exists(temp))File.Delete(temp);}
  }
  static void ValidateTargets(string root){

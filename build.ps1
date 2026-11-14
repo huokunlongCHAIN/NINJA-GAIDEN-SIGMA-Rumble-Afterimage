@@ -33,16 +33,21 @@ $objects=@('buffer.c','hook.c','trampoline.c','hde\hde64.c') | ForEach-Object {
  if($LASTEXITCODE -ne 0){throw ('MinHook build failed for '+$_)}
  $object
 }
+$shaderCompiler=Join-Path $build 'compile_afterimage_shaders.exe'
+& $compiler '-std=c++17' '-O2' '-static' (Join-Path $base 'tools\compile_afterimage_shaders.cpp') '-ld3dcompiler' '-o' $shaderCompiler
+if($LASTEXITCODE -ne 0){throw 'Afterimage shader compiler build failed'}
+& $shaderCompiler (Join-Path $build 'afterimage_shaders.generated.h')
+if($LASTEXITCODE -ne 0){throw 'Afterimage shader compilation failed'}
 $icons=@()
 if($IconHeader){
  Copy-Item -LiteralPath $IconHeader -Destination (Join-Path $build 'icon_data.generated.h') -Force
  $icons=@('-DNGS1_LOCAL_ICONS','-I',$build)
 }
-& $compiler '-std=c++17' '-O2' '-s' '-shared' '-static' '-Wall' '-Wextra' '-Wno-unused-parameter' '-I' $minhook @icons (Join-Path $base 'native\rumble.cpp') (Join-Path $base 'native\afterimage.cpp') (Join-Path $base 'native\dinput8.def') @objects '-lbcrypt' '-luser32' '-lhid' '-lsetupapi' '-ldxguid' '-ld3dcompiler' '-o' (Join-Path $base 'payload\dinput8.dll')
+& $compiler '-std=c++17' '-O2' '-s' '-shared' '-static' '-Wall' '-Wextra' '-Wno-unused-parameter' '-I' $minhook '-I' $build @icons (Join-Path $base 'native\rumble.cpp') (Join-Path $base 'native\afterimage.cpp') (Join-Path $base 'native\dinput8.def') @objects '-lbcrypt' '-luser32' '-lhid' '-lsetupapi' '-ldxguid' '-o' (Join-Path $base 'payload\dinput8.dll')
 if($LASTEXITCODE -ne 0){throw 'Integrated core build failed'}
 Sign-PatchBinary (Join-Path $base 'payload\dinput8.dll')
 if($RunRenderTests){
- & $compiler '-std=c++17' '-O2' '-static' '-I' $minhook (Join-Path $base 'native\test_overlay.cpp') @objects '-ld3dcompiler' '-ld3d11' '-lbcrypt' '-luser32' '-ldxguid' '-o' (Join-Path $build 'test_overlay.exe')
+ & $compiler '-std=c++17' '-O2' '-static' '-I' $minhook '-I' $build (Join-Path $base 'native\test_overlay.cpp') @objects '-ld3dcompiler' '-ld3d11' '-lbcrypt' '-luser32' '-ldxguid' '-o' (Join-Path $build 'test_overlay.exe')
  if($LASTEXITCODE -ne 0){throw 'Render test build failed'}
  & (Join-Path $build 'test_overlay.exe')
  if($LASTEXITCODE -ne 0){throw 'Render tests failed'}
@@ -89,11 +94,16 @@ if(!$reuse){
  Sign-PatchBinary $autoPath
  @{inputHash=$inputHash;binaryHash=(Get-FileHash -LiteralPath $autoPath).Hash}|ConvertTo-Json|Set-Content -LiteralPath $cachePath -Encoding utf8
 }
+$traceHelper=Join-Path $build 'NGS1CrashTrace.exe'
+& $compiler '-std=c++17' '-O2' '-s' '-static' '-municode' (Join-Path $base 'tools\crash_trace.cpp') '-o' $traceHelper
+if($LASTEXITCODE -ne 0){throw 'Crash trace helper build failed'}
+Sign-PatchBinary $traceHelper
 $hashRows=@()
 foreach($name in @('dinput8.dll','NGS1Rumble.ini','NGS1RumbleRules.ini','NGS1RumbleWaves.ini','NGS1RumbleAuto.exe')){
  $hash=(Get-FileHash -LiteralPath (Join-Path $base ('payload\'+$name))).Hash
  $hashRows+=('  {"'+$name+'","'+$hash+'"},')
 }
+$hashRows+=('  {"NGS1CrashTrace.exe","'+(Get-FileHash -LiteralPath $traceHelper).Hash+'"},')
 $hashSource="using System.Collections.Generic;`r`nnamespace NgsRumblePatch { public static class PayloadHashes { public static readonly Dictionary<string,string> Values=new Dictionary<string,string>{`r`n"+($hashRows -join "`r`n")+"`r`n}; } }"
 [IO.File]::WriteAllText((Join-Path $base 'build\PayloadHashes.cs'),$hashSource,[Text.UTF8Encoding]::new($false))
 $csc='C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
@@ -102,7 +112,7 @@ $resources=@()
 foreach($name in @('dinput8.dll','NGS1Rumble.ini','NGS1RumbleRules.ini','NGS1RumbleWaves.ini','NGS1RumbleAuto.exe')){$resources+=('/resource:'+(Join-Path $base ('payload\'+$name))+',Payload.'+$name)}
 $engineSources=@('Payload.cs','PatchEngine.cs','GameCompatibility.cs','Launcher.cs','CleanUninstall.cs','RuntimeBridge.cs','AutoLifecycle.cs','Features.cs','InstallerLanguage.cs') | ForEach-Object {Join-Path $base ('src\'+$_)}
 $installer=Join-Path $base 'release\NGS1RumblePatch.exe'
-& $csc @common '/target:winexe' '/reference:System.Windows.Forms.dll' '/reference:System.Drawing.dll' '/reference:System.IO.Compression.dll' '/reference:System.Xml.Linq.dll' ('/out:'+$installer) @engineSources (Join-Path $base 'src\InstallerSession.cs') (Join-Path $base 'src\Program.cs') (Join-Path $base 'src\RoundedControls.cs') (Join-Path $base 'src\PatchDiagnostics.cs') $metadataPath (Join-Path $base 'build\PayloadHashes.cs') (Join-Path $base 'build\ReleasedCoreHashes.cs') @resources
+& $csc @common '/target:winexe' '/reference:System.Windows.Forms.dll' '/reference:System.Drawing.dll' '/reference:System.IO.Compression.dll' '/reference:System.Xml.Linq.dll' ('/out:'+$installer) @engineSources (Join-Path $base 'src\InstallerSession.cs') (Join-Path $base 'src\Program.cs') (Join-Path $base 'src\RoundedControls.cs') (Join-Path $base 'src\PatchDiagnostics.cs') $metadataPath (Join-Path $base 'build\PayloadHashes.cs') (Join-Path $base 'build\ReleasedCoreHashes.cs') @resources ('/resource:'+$traceHelper+',Payload.NGS1CrashTrace.exe')
 if($LASTEXITCODE -ne 0){throw 'Installer build failed'}
 Sign-PatchBinary $installer
 if(Test-Path -LiteralPath (Join-Path $base 'tests\InstallerTests.cs')){

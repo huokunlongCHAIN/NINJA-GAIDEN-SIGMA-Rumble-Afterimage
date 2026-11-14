@@ -29,6 +29,52 @@ internal static class PatchDiagnostics {
 
  static string LogName(string root){return "installer-"+(root==null?"general":RuntimeBridge.Key(root))+".log";}
 
+ static string TraceName(string root){return "crash-trace-"+RuntimeBridge.Key(root)+".log";}
+
+ internal static string Trace(string input){
+  string root=PatchEngine.Root(input);
+  GameCompatibility.Validate(PatchEngine.Child(root,Payload.ExeName));
+  using(var guard=new Mutex(false,@"Local\NGS1CrashTrace-"+RuntimeBridge.Key(root))){
+   bool acquired;
+   try{acquired=guard.WaitOne(0);}catch(AbandonedMutexException){acquired=true;}
+   if(!acquired)throw new InvalidOperationException(InstallerLanguage.T(
+    "这个游戏目录已经在追踪中。","Crash tracing is already active for this game folder."));
+   try{
+    TraceGame(root);
+   }finally{guard.ReleaseMutex();}
+  }
+  return InstallerLanguage.T("本次崩溃追踪已结束。请点击「导出诊断包」。",
+   "Crash tracing ended. Choose Export Diagnostics.");
+ }
+
+ static void TraceGame(string root){
+  var running=RuntimeBridge.Games(root);
+  try{
+   if(running.Length>1)throw new InvalidOperationException(InstallerLanguage.T(
+    "同一目录有多个游戏进程，请先退出多余的实例。","Close extra game instances in this folder first."));
+   Directory.CreateDirectory(LogFolder);
+   string trace=PatchEngine.Child(LogFolder,TraceName(root));
+   string helper=PatchEngine.Child(LogFolder,".trace-"+Guid.NewGuid().ToString("N")+".exe");
+   try{
+    File.WriteAllBytes(helper,Payload.LoadExtra("NGS1CrashTrace.exe").Bytes);
+    int pid=running.Length==1?running[0].Id:new FeatureFacade().Launch(root);
+    using(var process=Process.Start(new ProcessStartInfo{
+     FileName=helper,Arguments=pid.ToString(CultureInfo.InvariantCulture)+" \""+trace+"\"",
+     UseShellExecute=false,CreateNoWindow=true,WorkingDirectory=LogFolder
+    })){
+     if(process==null)throw new InvalidOperationException("Crash tracing helper did not start.");
+     process.WaitForExit();
+     if(process.ExitCode!=0)throw new InvalidOperationException(InstallerLanguage.T(
+      "无法记录崩溃调用栈，诊断包会包含错误信息。","Could not capture crash frames. Export diagnostics for the error details."));
+    }
+   }finally{
+    try{File.Delete(helper);}
+    catch(IOException error){Failure("trace-helper-cleanup",root,error);}
+    catch(UnauthorizedAccessException error){Failure("trace-helper-cleanup",root,error);}
+   }
+  }finally{foreach(var game in running)game.Dispose();}
+ }
+
  internal static T Run<T>(string operation,string input,Func<T> action){
   Log(operation,"BEGIN",input,"");
   try{
@@ -166,6 +212,7 @@ internal static class PatchDiagnostics {
      AddLog(zip,label,PatchEngine.Child(LogFolder,name),root,report);
      AddLog(zip,label+".previous",PatchEngine.Child(LogFolder,name+".previous"),root,report);
     }
+    if(root!=null)AddLog(zip,"game-crash-stack.log",PatchEngine.Child(LogFolder,TraceName(root)),root,report);
     string game=null;
     if(root!=null){
      try{

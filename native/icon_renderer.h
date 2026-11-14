@@ -4,7 +4,8 @@
 #include <unordered_map>
 #include <mutex>
 #include <atomic>
-#include "MinHook.h"
+#include <array>
+#include "render_vtable.h"
 #include "controller_glyphs.h"
 #ifdef NGS1_LOCAL_ICONS
 #include "icon_data.generated.h"
@@ -20,8 +21,6 @@ static std::vector<Pair> pairs;
 static std::unordered_map<ID3D11ShaderResourceView*,size_t> views;
 static std::unordered_map<ID3D11Resource*,size_t> textures;
 static std::vector<ID3D11ShaderResourceView*> pending;
-static std::unordered_map<void*,void*> originals;
-static std::unordered_map<void*,unsigned> originalSlots;
 static std::unordered_map<ID3D11DeviceContext*,int> modes;
 static std::recursive_mutex lock;
 static std::atomic<bool> desiredPS{false};
@@ -35,7 +34,12 @@ typedef void(STDMETHODCALLTYPE* IndexedFn)(ID3D11DeviceContext*,UINT,UINT,INT);
 typedef void(STDMETHODCALLTYPE* InstancedFn)(ID3D11DeviceContext*,UINT,UINT,UINT,UINT);
 typedef void(STDMETHODCALLTYPE* IndexedInstancedFn)(ID3D11DeviceContext*,UINT,UINT,UINT,INT,UINT);
 typedef void(STDMETHODCALLTYPE* ExecuteFn)(ID3D11DeviceContext*,ID3D11CommandList*,BOOL);
-template<class T>inline T Original(ID3D11DeviceContext* context,unsigned index){void* target=(*reinterpret_cast<void***>(context))[index];return reinterpret_cast<T>(originals.at(target));}
+static std::array<RenderVtable::Slot,7> entries{};
+template<class T>inline T Original(ID3D11DeviceContext* context,unsigned index){
+ auto* address=RenderVtable::Table(context)+index;
+ for(const auto& entry:entries)if(entry.address==address)return reinterpret_cast<T>(entry.original);
+ return reinterpret_cast<T>(*address);
+}
 template<class T>struct Ref {T* p=nullptr;~Ref(){if(p)p->Release();}T** out(){return &p;}T* operator->(){return p;}};
 inline uint64_t Hash(const BYTE* data,size_t size){uint64_t h=14695981039346656037ull;for(size_t i=0;i<size;++i)h=(h^data[i])*1099511628211ull;return h;}
 inline bool Parse(){
@@ -106,35 +110,35 @@ inline void Refresh(ID3D11DeviceContext* context){
  for(unsigned i=0;i<128;++i){replacement[i]=current[i];auto pair=Find(context,current[i]);if(pair&&!pair->mutableTexture){replacement[i]=mode?pair->ps:pair->xbox;changed|=replacement[i]!=current[i];}}
  if(changed)Original<SetFn>(context,8)(context,0,128,replacement);for(auto view:current)if(view)view->Release();modes[context]=mode;
 }
-static void STDMETHODCALLTYPE Set(ID3D11DeviceContext* context,UINT first,UINT count,ID3D11ShaderResourceView* const* input){
- auto next=Original<SetFn>(context,8);if(!enabled||!input||count>128){next(context,first,count,input);return;}
+static void Set(SetFn next,ID3D11DeviceContext* context,UINT first,UINT count,ID3D11ShaderResourceView* const* input){
+ if(!enabled||!input||count>128){next(context,first,count,input);return;}
  static std::atomic<unsigned> calls{0};if(calls++<2&&log)log("ICON_SRV_ACTIVITY context_type=%u",context->GetType());
  try{std::lock_guard<std::recursive_mutex> guard(lock);ID3D11ShaderResourceView* output[128]{};bool ps=desiredPS;
   for(UINT i=0;i<count;++i){auto pair=Find(context,input[i]);output[i]=pair&&!pair->mutableTexture?(ps?pair->ps:pair->xbox):input[i];}next(context,first,count,output);
  }catch(...){next(context,first,count,input);}
 }
-static void STDMETHODCALLTYPE Draw(ID3D11DeviceContext* c,UINT n,UINT first){try{if(enabled)Refresh(c);}catch(...){}Original<DrawFn>(c,13)(c,n,first);}
-static void STDMETHODCALLTYPE Indexed(ID3D11DeviceContext* c,UINT n,UINT first,INT vertex){
+static void Draw(DrawFn next,ID3D11DeviceContext* c,UINT n,UINT first){try{if(enabled)Refresh(c);}catch(...){}next(c,n,first);}
+static void Indexed(IndexedFn next,ID3D11DeviceContext* c,UINT n,UINT first,INT vertex){
  try{if(enabled)Refresh(c);}catch(...){}
  const auto* handlers=afterimage.load();
- if(!handlers||!handlers->indexed(c,n,first,vertex))Original<IndexedFn>(c,12)(c,n,first,vertex);
+ if(!handlers||!handlers->indexed(next,c,n,first,vertex))next(c,n,first,vertex);
 }
-static void STDMETHODCALLTYPE Instanced(ID3D11DeviceContext* c,UINT n,UINT instances,UINT first,UINT instance){try{if(enabled)Refresh(c);}catch(...){}Original<InstancedFn>(c,21)(c,n,instances,first,instance);}
-static void STDMETHODCALLTYPE IndexedInstanced(ID3D11DeviceContext* c,UINT n,UINT instances,UINT first,INT vertex,UINT instance){
+static void Instanced(InstancedFn next,ID3D11DeviceContext* c,UINT n,UINT instances,UINT first,UINT instance){try{if(enabled)Refresh(c);}catch(...){}next(c,n,instances,first,instance);}
+static void IndexedInstanced(IndexedInstancedFn next,ID3D11DeviceContext* c,UINT n,UINT instances,UINT first,INT vertex,UINT instance){
  try{if(enabled)Refresh(c);}catch(...){}
  const auto* handlers=afterimage.load();
- if(!handlers||!handlers->indexedInstanced(c,n,instances,first,vertex,instance))
-  Original<IndexedInstancedFn>(c,20)(c,n,instances,first,vertex,instance);
+ if(!handlers||!handlers->indexedInstanced(next,c,n,instances,first,vertex,instance))
+  next(c,n,instances,first,vertex,instance);
 }
-static void STDMETHODCALLTYPE Execute(ID3D11DeviceContext* c,ID3D11CommandList* commands,BOOL restore){
+static void Execute(ExecuteFn next,ID3D11DeviceContext* c,ID3D11CommandList* commands,BOOL restore){
  try{if(enabled)Sync(c);}catch(...){}
  const auto* handlers=afterimage.load();
- if(!handlers||!handlers->execute(c,commands,restore))Original<ExecuteFn>(c,58)(c,commands,restore);
+ if(!handlers||!handlers->execute(next,c,commands,restore))next(c,commands,restore);
 }
-inline void* SharedOriginal(void* target,unsigned slot){
- if(!enabled||(slot!=12&&slot!=20&&slot!=58))return nullptr;
- auto found=originalSlots.find(target);
- return found==originalSlots.end()||found->second!=slot?nullptr:originals.at(target);
+inline void* SharedOriginal(void** table,unsigned slot){
+ if(!enabled)return nullptr;
+ for(const auto& entry:entries)if(entry.address==table+slot&&*entry.address==entry.observer)return entry.original;
+ return nullptr;
 }
 inline void ConnectAfterimage(const AfterimageDrawHandlers* handlers){afterimage=handlers;}
 inline bool Initialize(void(*logger)(const char*,...)){
@@ -142,15 +146,27 @@ inline bool Initialize(void(*logger)(const char*,...)){
  auto create=reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(GetProcAddress(module,"D3D11CreateDevice"));if(!create)return false;
  Ref<ID3D11Device> device;Ref<ID3D11DeviceContext> context;D3D_FEATURE_LEVEL level=D3D_FEATURE_LEVEL_11_0;
  HRESULT result=create(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,&level,1,D3D11_SDK_VERSION,device.out(),nullptr,context.out());if(FAILED(result)){if(log)log("ICON_DEVICE_FAILED result=%08lx",result);return false;}
- Ref<ID3D11DeviceContext> deferred;device->CreateDeferredContext(0,deferred.out());auto table=*reinterpret_cast<void***>(context.p);
- const unsigned indices[]={8,12,13,20,21,58};void* handlers[]={reinterpret_cast<void*>(Set),reinterpret_cast<void*>(Indexed),reinterpret_cast<void*>(Draw),reinterpret_cast<void*>(IndexedInstanced),reinterpret_cast<void*>(Instanced),reinterpret_cast<void*>(Execute)};
- std::vector<void*> targets;bool ok=true;
- for(unsigned row=0;row<(deferred.p?2u:1u)&&ok;++row){auto slots=row?*reinterpret_cast<void***>(deferred.p):table;for(unsigned n=0;n<(row?1u:6u);++n){void* target=slots[indices[n]];if(originals.count(target))continue;void* original=nullptr;auto status=MH_CreateHook(target,handlers[n],&original);if(status!=MH_OK){ok=false;break;}originals[target]=original;originalSlots[target]=indices[n];targets.push_back(target);}}
- auto rollback=[&]{enabled=false;for(auto target:targets)MH_RemoveHook(target);originals.clear();originalSlots.clear();return false;};
- if(!ok){if(log)log("ICON_HOOK_CREATE_FAILED made=%u",unsigned(targets.size()));return rollback();}
- for(auto target:targets)if(MH_QueueEnableHook(target)!=MH_OK)return rollback();
+ Ref<ID3D11DeviceContext> deferred;
+ device->CreateDeferredContext(0,deferred.out());
+ auto* table=RenderVtable::Table(context.p);
+ auto* deferredTable=deferred.p?RenderVtable::Table(deferred.p):table;
+ entries[0]={table+8,table[8],reinterpret_cast<void*>(RenderVtable::Observer<SetFn,Set>::Call<entries,0>),8,log};
+ entries[1]={table+12,table[12],reinterpret_cast<void*>(RenderVtable::Observer<IndexedFn,Indexed>::Call<entries,1>),12,log};
+ entries[2]={table+13,table[13],reinterpret_cast<void*>(RenderVtable::Observer<DrawFn,Draw>::Call<entries,2>),13,log};
+ entries[3]={table+20,table[20],reinterpret_cast<void*>(RenderVtable::Observer<IndexedInstancedFn,IndexedInstanced>::Call<entries,3>),20,log};
+ entries[4]={table+21,table[21],reinterpret_cast<void*>(RenderVtable::Observer<InstancedFn,Instanced>::Call<entries,4>),21,log};
+ entries[5]={table+58,table[58],reinterpret_cast<void*>(RenderVtable::Observer<ExecuteFn,Execute>::Call<entries,5>),58,log};
+ if(deferredTable!=table)
+  entries[6]={deferredTable+8,deferredTable[8],reinterpret_cast<void*>(RenderVtable::Observer<SetFn,Set>::Call<entries,6>),8,log};
+ for(size_t i=0;i<entries.size()&&entries[i].address;++i){
+  auto& entry=entries[i];
+  if(!entry.Exchange(entry.original,entry.observer)){
+   if(log)log("ICON_VTABLE_INSTALL_FAILED slot=%u",entry.index);
+   while(i)entries[--i].Restore();
+   return false;
+  }
+ }
  enabled=true;
- if(MH_ApplyQueued()!=MH_OK)return rollback();
  if(log)log("ICON_RENDERER_READY builtin=1 custom_variants=%u",unsigned(patches.size()));return true;
 }
 inline void Select(bool ps){bool old=desiredPS.exchange(ps);if(old!=ps&&log)log("ICON_MODE target=%s",ps?"PS":"Xbox");}

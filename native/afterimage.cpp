@@ -2,7 +2,6 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
-#include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <array>
 #include <algorithm>
@@ -27,10 +26,17 @@
 #include "body_parts.h"
 #include "costumes.h"
 #include "render_hook_bridge.h"
+#include "render_vtable.h"
+#include "afterimage_shaders.generated.h"
 
 namespace {
 using Microsoft::WRL::ComPtr;
 using Context = ID3D11DeviceContext;
+using PrepareGameDraw = bool (*)(void*, int);
+constexpr size_t GameContextOffset = 0x10;
+constexpr size_t RendererWorkerOffset = 0x2b28;
+constexpr size_t GameDeviceOffset = 0x3078;
+constexpr size_t GameSwapOffset = 0x3080;
 constexpr UINT VertexSlots = 8;
 constexpr UINT ConstantSlots = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
 constexpr UINT ColorSlot = ConstantSlots - 1;
@@ -64,11 +70,10 @@ using SetBlend = void (STDMETHODCALLTYPE*)(Context*, ID3D11BlendState*, const FL
 using SetDepth = void (STDMETHODCALLTYPE*)(Context*, ID3D11DepthStencilState*, UINT);
 using SetViewport = void (STDMETHODCALLTYPE*)(Context*, UINT, const D3D11_VIEWPORT*);
 using ClearDepth = void (STDMETHODCALLTYPE*)(Context*, ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
-using DrawIndexed = void (STDMETHODCALLTYPE*)(Context*, UINT, UINT, INT);
-using DrawIndexedInstanced = void (STDMETHODCALLTYPE*)(Context*, UINT, UINT, UINT, INT, UINT);
-using ExecuteList = void (STDMETHODCALLTYPE*)(Context*, ID3D11CommandList*, BOOL);
+using ExecuteList = ExecuteDrawList;
 using FinishList = HRESULT (STDMETHODCALLTYPE*)(Context*, BOOL, ID3D11CommandList**);
 using ClearContext = void (STDMETHODCALLTYPE*)(Context*);
+using CreateDeferred = HRESULT (STDMETHODCALLTYPE*)(ID3D11Device*, UINT, Context**);
 using Present = HRESULT (STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 using GameFrame = void (*)(void*, void*);
 
@@ -190,6 +195,15 @@ struct SceneDepth {
     bool frozen = false;
 };
 
+struct OverlayCoverageProbe {
+    ComPtr<ID3D11Query> geometry, composite;
+    uint64_t frame = 0;
+    unsigned samples = 0;
+    unsigned draws = 0;
+    bool pending = false;
+    bool sceneDepth = false;
+};
+
 struct DeviceResources {
     ComPtr<ID3D11PixelShader> maskShader;
     ComPtr<ID3D11PixelShader> ghostShader;
@@ -211,6 +225,7 @@ struct DeviceResources {
     D3D11_TEXTURE2D_DESC coverageDesc{};
     RefractionResources refraction;
     SceneDepth sceneDepth;
+    OverlayCoverageProbe coverageProbe;
     std::vector<OverlayDraw> overlayDraws;
     std::array<PoseFrame, PoseHistorySize> trail;
     unsigned nextTrail = 0;
@@ -247,6 +262,7 @@ struct Settings {
     bool autoWallDownslash = true;
     bool autoSwallow = true;
     bool autoWhiteFeather = true;
+    unsigned sceneDepthMode = 0;
     unsigned interval = 12;
     unsigned lifetime = 185;
     unsigned copies = 5;
@@ -266,8 +282,8 @@ struct Settings {
 
 std::recursive_mutex renderMutex;
 std::mutex logMutex;
-std::unordered_map<void*, void*> originals;
-std::unordered_set<void*> sharedRenderTargets;
+std::unordered_map<void**, const RenderVtable::Slot*> originals;
+std::unordered_set<void**> sharedRenderSlots;
 ControllerRenderHooks controllerHooks{};
 std::unordered_map<Context*, ContextState> contexts;
 std::unordered_map<ID3D11Device*, DeviceResources> resources;
@@ -315,12 +331,24 @@ unsigned loggedOverlays = 0;
 unsigned loggedPoses = 0;
 unsigned loggedEyes = 0;
 unsigned loggedStompPhases = 0;
-Present originalPresent = nullptr;
+struct RenderActivity {
+    unsigned long long indexed = 0, stateReady = 0, costume = 0, sceneColor = 0, presented = 0;
+    unsigned long long prepared = 0, rebound = 0;
+    D3D11_VIEWPORT viewport{};
+};
+RenderActivity activity;
 GameFrame originalGameFrame = nullptr;
+PrepareGameDraw originalPrepareGameDraw = nullptr;
+bool gameWorkerLayoutVerified = false;
 std::atomic<IDXGISwapChain*> gameSwap{nullptr};
 unsigned captureSerial = 0;
 std::atomic<bool> hooksReady{false};
 thread_local bool drawingExtra = false;
+thread_local bool forwardingIndexed = false;
+bool intelAdapter = false;
+bool loggedCameraCopy = false;
+bool loggedDepthSetup = false;
+bool loggedDepthCopy = false;
 
 uint64_t PoseClockUs() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -470,9 +498,12 @@ void UpdateAction() {
 
 template<class Fn>
 Fn Original(Context* context, Slot slot) {
-    void* address = (*reinterpret_cast<void***>(context))[slot];
-    auto found = originals.find(address);
-    return reinterpret_cast<Fn>(found == originals.end() ? address : found->second);
+    auto* table = RenderVtable::Table(context);
+    if (controllerHooks.original)
+        if (auto* next = controllerHooks.original(table, slot)) return reinterpret_cast<Fn>(next);
+    if (auto found = originals.find(table + slot); found != originals.end() && table[slot] == found->second->observer)
+        return reinterpret_cast<Fn>(found->second->Next());
+    return reinterpret_cast<Fn>(table[slot]);
 }
 
 template<class T, size_t N>
@@ -481,13 +512,15 @@ void WriteRange(std::array<T, N>& destination, UINT first, UINT count, const T* 
         destination[first + i] = values ? values[i] : T{};
 }
 
-void STDMETHODCALLTYPE TrackVSConstants(Context* c, UINT first, UINT count, ID3D11Buffer* const* buffers) {
+void TrackVSConstants(SetBuffers next, Context* c, UINT first, UINT count, ID3D11Buffer* const* buffers) {
+    if (drawingExtra) return next(c, first, count, buffers);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
     WriteRange(contexts[c].vsConstants, first, count, buffers);
-    Original<SetBuffers>(c, VsConstants)(c, first, count, buffers);
+    next(c, first, count, buffers);
 }
 
-void STDMETHODCALLTYPE TrackVertex(Context* c, UINT first, UINT count, ID3D11Buffer* const* buffers, const UINT* strides, const UINT* offsets) {
+void TrackVertex(SetVertex next, Context* c, UINT first, UINT count, ID3D11Buffer* const* buffers, const UINT* strides, const UINT* offsets) {
+    if (drawingExtra) return next(c, first, count, buffers, strides, offsets);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
     auto& state = contexts[c];
     for (UINT i = 0; i < count; ++i) {
@@ -505,10 +538,11 @@ void STDMETHODCALLTYPE TrackVertex(Context* c, UINT first, UINT count, ID3D11Buf
         binding.stride = strides ? strides[i] : 0;
         binding.offset = offsets ? offsets[i] : 0;
     }
-    Original<SetVertex>(c, VertexBuffers)(c, first, count, buffers, strides, offsets);
+    next(c, first, count, buffers, strides, offsets);
 }
 
-void STDMETHODCALLTYPE TrackIndex(Context* c, ID3D11Buffer* buffer, DXGI_FORMAT format, UINT offset) {
+void TrackIndex(SetIndex next, Context* c, ID3D11Buffer* buffer, DXGI_FORMAT format, UINT offset) {
+    if (drawingExtra) return next(c, buffer, format, offset);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
     auto& state = contexts[c];
     if (state.index != buffer) {
@@ -518,32 +552,36 @@ void STDMETHODCALLTYPE TrackIndex(Context* c, ID3D11Buffer* buffer, DXGI_FORMAT 
     state.index = buffer;
     state.indexFormat = format;
     state.indexOffset = offset;
-    Original<SetIndex>(c, IndexBuffer)(c, buffer, format, offset);
+    next(c, buffer, format, offset);
 }
 
-void STDMETHODCALLTYPE TrackLayout(Context* c, ID3D11InputLayout* layout) {
+void TrackLayout(SetLayout next, Context* c, ID3D11InputLayout* layout) {
+    if (drawingExtra) return next(c, layout);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
     contexts[c].layout = layout;
-    Original<SetLayout>(c, InputLayout)(c, layout);
+    next(c, layout);
 }
 
-void STDMETHODCALLTYPE TrackTopology(Context* c, D3D11_PRIMITIVE_TOPOLOGY topology) {
+void TrackTopology(SetTopology next, Context* c, D3D11_PRIMITIVE_TOPOLOGY topology) {
+    if (drawingExtra) return next(c, topology);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
     contexts[c].topology = topology;
-    Original<SetTopology>(c, Topology)(c, topology);
+    next(c, topology);
 }
 
-void STDMETHODCALLTYPE TrackPS(Context* c, ID3D11PixelShader* shader, ID3D11ClassInstance* const* classes, UINT count) {
+void TrackPS(SetPS next, Context* c, ID3D11PixelShader* shader, ID3D11ClassInstance* const* classes, UINT count) {
+    if (drawingExtra) return next(c, shader, classes, count);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
     contexts[c].ps = shader;
     contexts[c].psClasses = count;
-    Original<SetPS>(c, PsShader)(c, shader, classes, count);
+    next(c, shader, classes, count);
 }
 
-void STDMETHODCALLTYPE TrackVS(Context* c, ID3D11VertexShader* shader, ID3D11ClassInstance* const* classes, UINT count) {
+void TrackVS(SetVS next, Context* c, ID3D11VertexShader* shader, ID3D11ClassInstance* const* classes, UINT count) {
+    if (drawingExtra) return next(c, shader, classes, count);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
     contexts[c].vs = shader;
-    Original<SetVS>(c, VsShader)(c, shader, classes, count);
+    next(c, shader, classes, count);
 }
 
 void RememberTargets(ContextState& state, UINT count, ID3D11RenderTargetView* const* views, ID3D11DepthStencilView* depth) {
@@ -553,53 +591,70 @@ void RememberTargets(ContextState& state, UINT count, ID3D11RenderTargetView* co
     state.depthView = depth;
 }
 
-void STDMETHODCALLTYPE TrackTargets(Context* c, UINT count, ID3D11RenderTargetView* const* views, ID3D11DepthStencilView* depth) {
+void TrackTargets(SetTargets next, Context* c, UINT count, ID3D11RenderTargetView* const* views, ID3D11DepthStencilView* depth) {
+    if (drawingExtra) return next(c, count, views, depth);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
     auto& state = contexts[c];
     RememberTargets(state, count, views, depth);
     state.uavsBound = false;
-    Original<SetTargets>(c, Targets)(c, count, views, depth);
+    next(c, count, views, depth);
 }
 
-void STDMETHODCALLTYPE TrackTargetsUav(Context* c, UINT count, ID3D11RenderTargetView* const* views, ID3D11DepthStencilView* depth, UINT start, UINT uavCount, ID3D11UnorderedAccessView* const* uavs, const UINT* initialCounts) {
+void TrackTargetsUav(SetTargetsUav next, Context* c, UINT count, ID3D11RenderTargetView* const* views, ID3D11DepthStencilView* depth, UINT start, UINT uavCount, ID3D11UnorderedAccessView* const* uavs, const UINT* initialCounts) {
+    if (drawingExtra) return next(c, count, views, depth, start, uavCount, uavs, initialCounts);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
     auto& state = contexts[c];
     if (count != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) RememberTargets(state, count, views, depth);
     if (uavCount != D3D11_KEEP_UNORDERED_ACCESS_VIEWS) state.uavsBound = uavCount != 0;
-    Original<SetTargetsUav>(c, TargetsAndUavs)(c, count, views, depth, start, uavCount, uavs, initialCounts);
+    next(c, count, views, depth, start, uavCount, uavs, initialCounts);
 }
 
-void STDMETHODCALLTYPE TrackBlend(Context* c, ID3D11BlendState* blend, const FLOAT* factors, UINT mask) {
+void TrackBlend(SetBlend next, Context* c, ID3D11BlendState* blend, const FLOAT* factors, UINT mask) {
+    if (drawingExtra) return next(c, blend, factors, mask);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
     auto& state = contexts[c];
     state.blendState = blend;
     state.sampleMask = mask;
     state.blendFactor = {1, 1, 1, 1};
     if (factors) std::copy_n(factors, 4, state.blendFactor.begin());
-    Original<SetBlend>(c, Blend)(c, blend, factors, mask);
+    next(c, blend, factors, mask);
 }
 
-void STDMETHODCALLTYPE TrackDepth(Context* c, ID3D11DepthStencilState* depth, UINT stencil) {
+void TrackDepth(SetDepth next, Context* c, ID3D11DepthStencilState* depth, UINT stencil) {
+    if (drawingExtra) return next(c, depth, stencil);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
     contexts[c].depthState = depth;
     contexts[c].stencil = stencil;
-    Original<SetDepth>(c, Depth)(c, depth, stencil);
+    next(c, depth, stencil);
 }
 
-void STDMETHODCALLTYPE TrackViewport(Context* c, UINT count, const D3D11_VIEWPORT* viewport) {
+void TrackViewport(SetViewport next, Context* c, UINT count, const D3D11_VIEWPORT* viewport) {
+    if (drawingExtra) return next(c, count, viewport);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
     contexts[c].viewportCount = count;
     if (count && viewport) contexts[c].viewport = viewport[0];
-    Original<SetViewport>(c, Viewports)(c, count, viewport);
+    next(c, count, viewport);
 }
 
 void CopySceneDepth(Context* c, const SceneDepth& depth) {
+    const bool first = !loggedDepthCopy;
+    if (first) Log("SCENE_DEPTH_COPY_BEGIN");
     c->CopySubresourceRegion(depth.snapshot.Get(), 0, 0, 0, 0, depth.source.Get(), depth.subresource, nullptr);
+    if (first) {
+        loggedDepthCopy = true;
+        Log("SCENE_DEPTH_COPY_READY");
+    }
 }
 
-void STDMETHODCALLTYPE ObserveClearDepth(Context* c, ID3D11DepthStencilView* view, UINT flags, FLOAT value, UINT8 stencil) {
+bool SceneDepthEnabled() {
+    // Intel's compatibility path leaves the main depth texture with the game.
+    return settings.sceneDepthMode == 2 || (settings.sceneDepthMode == 0 && !intelAdapter);
+}
+
+void ObserveClearDepth(ClearDepth next, Context* c, ID3D11DepthStencilView* view, UINT flags, FLOAT value, UINT8 stencil) {
+    if (drawingExtra) return next(c, view, flags, value, stencil);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
-    if (!drawingExtra && settings.enabled && (flags & D3D11_CLEAR_DEPTH)) {
+    if (!drawingExtra && settings.enabled && SceneDepthEnabled() && (flags & D3D11_CLEAR_DEPTH)) {
         ComPtr<ID3D11Device> device;
         c->GetDevice(device.GetAddressOf());
         const auto found = resources.find(device.Get());
@@ -612,26 +667,27 @@ void STDMETHODCALLTYPE ObserveClearDepth(Context* c, ID3D11DepthStencilView* vie
             }
         }
     }
-    Original<ClearDepth>(c, ClearDepthView)(c, view, flags, value, stencil);
+    next(c, view, flags, value, stencil);
 }
 
-void STDMETHODCALLTYPE TrackClear(Context* c) {
-    std::lock_guard<std::recursive_mutex> guard(renderMutex);
-    auto& state = contexts[c];
+void ResetContextState(ContextState& state) {
     auto readbacks = std::move(state.readbacks);
     state = ContextState{};
     state.readbacks = std::move(readbacks);
-    Original<ClearContext>(c, Clear)(c);
 }
 
-bool CreateShader(ID3D11Device* device, const char* hlsl, ComPtr<ID3D11PixelShader>& shader) {
-    ComPtr<ID3DBlob> code, error;
-    HRESULT result = D3DCompile(hlsl, strlen(hlsl), nullptr, nullptr, nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, code.GetAddressOf(), error.GetAddressOf());
-    if (FAILED(result)) {
-        Log("SHADER_COMPILE_FAILED hr=%08lx", result);
-        return false;
-    }
-    return SUCCEEDED(device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, shader.GetAddressOf()));
+void TrackClear(ClearContext next, Context* c) {
+    if (drawingExtra) return next(c);
+    std::lock_guard<std::recursive_mutex> guard(renderMutex);
+    ResetContextState(contexts[c]);
+    next(c);
+}
+
+template<size_t Size>
+bool CreatePixelShader(ID3D11Device* device, const unsigned char (&bytecode)[Size], ComPtr<ID3D11PixelShader>& shader) {
+    const HRESULT result = device->CreatePixelShader(bytecode, Size, nullptr, shader.ReleaseAndGetAddressOf());
+    if (FAILED(result)) Log("CREATE_PIXEL_SHADER_FAILED hr=%08lx", result);
+    return SUCCEEDED(result);
 }
 
 D3D11_TEXTURE2D_DESC MaskDescription() {
@@ -647,7 +703,7 @@ D3D11_TEXTURE2D_DESC MaskDescription() {
 
 bool PrepareMask(ID3D11Device* device, DeviceResources& res) {
     if (res.maskTarget) return true;
-    if (!res.maskShader && !CreateShader(device, "float4 main():SV_Target{return 1;}", res.maskShader)) return false;
+    if (!res.maskShader && !CreatePixelShader(device, AfterimageShaders::Mask, res.maskShader)) return false;
     D3D11_DEPTH_STENCIL_DESC depth{};
     depth.DepthFunc = D3D11_COMPARISON_ALWAYS;
     if (!res.noDepth && FAILED(device->CreateDepthStencilState(&depth, res.noDepth.GetAddressOf()))) return false;
@@ -659,41 +715,9 @@ bool PrepareMask(ID3D11Device* device, DeviceResources& res) {
 
 // Grip of Murder albedo 0 packs bare skin and the black glove into one atlas.
 // The right arm's base skin and red curse pattern use albedos 1 and 25.
-constexpr char GripSkinMask[] = R"(
-    bool gripSkin(float2 uv) {
-        float2 p = frac(uv) * 512.0;
-        float left = p.y < 182 ? lerp(384, 363, (p.y - 68) / 114) :
-            p.y < 250 ? lerp(363, 267, (p.y - 182) / 68) : lerp(267, 296, (p.y - 250) / 162);
-        float right = p.y < 328 ? lerp(520, 487, (p.y - 68) / 260) :
-            p.y < 350 ? lerp(487, 427, (p.y - 328) / 22) : lerp(427, 416, (p.y - 350) / 62);
-        return p.y < 68 || p.y > 413 || p.x < left || p.x > right;
-    }
-)";
-
-constexpr char SceneOcclusion[] = R"(
-    Texture2D<float> sceneDepth : register(t2);
-    cbuffer SceneOcclusion : register(b10) {
-        float2 depthScale;
-        float depthDirection;
-        float depthBias;
-    }
-    void occlude(float4 pos) {
-        if (depthDirection != 0) {
-            float nearest = sceneDepth.Load(int3(int2(pos.xy * depthScale), 0));
-            clip(depthBias + (nearest - pos.z) * depthDirection);
-        }
-    })";
-
 bool PrepareGhost(ID3D11Device* device, DeviceResources& res) {
-    const std::string shader = std::string(SceneOcclusion) + R"(
-        cbuffer GhostLighting : register(b12) { float anchorOpacity; float brightness; }
-        cbuffer GhostColor : register(b13) { float4 color; }
-        float4 main(float4 pos : SV_Position) : SV_Target {
-            occlude(pos);
-            float opacity = anchorOpacity > 0 ? anchorOpacity : color.a;
-            return float4(color.rgb * (opacity * brightness), opacity);
-        })";
-    if (!res.ghostShader && !CreateShader(device, shader.c_str(), res.ghostShader)) return false;
+    const bool firstUse = !res.fadeUnderlayBlend;
+    if (!res.ghostShader && !CreatePixelShader(device, AfterimageShaders::Ghost, res.ghostShader)) return false;
     if (!res.ghostLighting) {
         D3D11_BUFFER_DESC desc{};
         desc.ByteWidth = 16;
@@ -730,24 +754,9 @@ bool PrepareGhost(ID3D11Device* device, DeviceResources& res) {
         if (FAILED(device->CreateBlendState(&blend, res.fadeBlend.GetAddressOf()))) return false;
     }
     if (!res.fadeBlend) return false;
-    if (!res.fadeUnderlay) {
-        constexpr char underlayLighting[] = R"(
-            float underlayLight(float4 pos) {
-                float z = rcp(max(abs(pos.w), 0.0001));
-                float3 normal = normalize(float3(-ddx(z), ddy(z), z * 0.0015));
-                return 0.36 + 0.64 * saturate(dot(normal, float3(-0.42, 0.44, 0.794)));
-            })";
-        const std::string underlay = std::string(underlayLighting) + R"(
-            float4 main(float4 pos : SV_Position) : SV_Target { return float4(underlayLight(pos).xxx, 1); }
-        )";
-        const std::string gripUnderlay = std::string(underlayLighting) + GripSkinMask + R"(
-            float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-                float light = underlayLight(pos) * (gripSkin(uv) ? 1.0 : 0.0);
-                return float4(light.xxx, 1);
-            }
-        )";
-        if (!CreateShader(device, gripUnderlay.c_str(), res.gripFadeUnderlay) ||
-            !CreateShader(device, underlay.c_str(), res.fadeUnderlay)) return false;
+    if (!res.fadeUnderlay || !res.gripFadeUnderlay) {
+        if (!CreatePixelShader(device, AfterimageShaders::GripUnderlay, res.gripFadeUnderlay) ||
+            !CreatePixelShader(device, AfterimageShaders::Underlay, res.fadeUnderlay)) return false;
     }
     if (!res.fadeUnderlayBlend) {
         D3D11_BLEND_DESC blend{};
@@ -778,6 +787,7 @@ bool PrepareGhost(ID3D11Device* device, DeviceResources& res) {
         }
         res.colorKey = colorKey;
     }
+    if (firstUse) Log("GHOST_PIPELINE_READY");
     return true;
 }
 
@@ -799,8 +809,8 @@ uint64_t MeshKey(const ContextState& state, const Draw& draw) {
 }
 
 void CallDraw(Context* c, const Draw& draw) {
-    if (draw.instanced) Original<DrawIndexedInstanced>(c, IndexedInstanced)(c, draw.count, 1, draw.first, draw.base, draw.instance);
-    else Original<DrawIndexed>(c, Indexed)(c, draw.count, draw.first, draw.base);
+    if (draw.instanced) Original<InstancedIndexedDraw>(c, IndexedInstanced)(c, draw.count, 1, draw.first, draw.base, draw.instance);
+    else Original<IndexedDraw>(c, Indexed)(c, draw.count, draw.first, draw.base);
 }
 
 void SaveReadback(Context* c, const Readback& readback) {
@@ -944,9 +954,15 @@ void CapturePart(Context* c, const ContextState& state, ID3D11Device* device, Po
 void CapturePlayer(Context* c, const ContextState& state, ID3D11Device* device, DeviceResources& res,
     const Draw& draw, uint64_t key, uint64_t nowUs, bool recording, bool stomp) {
     const bool charge = chargeTimeline.current.move != ChargeMove::None;
-    if (res.cameraFrame != renderFrame && state.vsConstants[ViewProjectionSlot] &&
-        CopyBuffer(c, device, state.vsConstants[ViewProjectionSlot], res.frameCamera)) {
-        res.cameraFrame = renderFrame;
+    if (res.cameraFrame != renderFrame && state.vsConstants[ViewProjectionSlot]) {
+        const bool first = !loggedCameraCopy;
+        if (first) Log("CAMERA_BUFFER_COPY_BEGIN");
+        const bool copied = CopyBuffer(c, device, state.vsConstants[ViewProjectionSlot], res.frameCamera);
+        if (copied) res.cameraFrame = renderFrame;
+        if (first) {
+            loggedCameraCopy = true;
+            Log("CAMERA_BUFFER_COPY_END ok=%u", unsigned(copied));
+        }
     }
     const bool releasePoseAlive = res.chargeOrigin.count && renderFrame - res.chargeOrigin.frame < AnchorEndAge;
     if (recording || (charge && chargeTimeline.current.visual != ChargeVisual::Off) ||
@@ -1132,6 +1148,11 @@ const CostumeMesh* ObserveCostume(uint64_t key) {
 void RememberSceneDepth(ID3D11Device* device, SceneDepth& depth, ID3D11DepthStencilView* view,
     ID3D11DepthStencilState* state, const D3D11_VIEWPORT& viewport) {
     if (!view || depth.frame == renderFrame) return;
+    const bool first = !loggedDepthSetup;
+    if (first) {
+        loggedDepthSetup = true;
+        Log("SCENE_DEPTH_SETUP_BEGIN");
+    }
     D3D11_DEPTH_STENCIL_DESC mode{};
     if (state) {
         state->GetDesc(&mode);
@@ -1190,6 +1211,20 @@ void RememberSceneDepth(ID3D11Device* device, SceneDepth& depth, ID3D11DepthSten
     depth.reversed = mode.DepthFunc == D3D11_COMPARISON_GREATER || mode.DepthFunc == D3D11_COMPARISON_GREATER_EQUAL;
     depth.frozen = false;
     depth.frame = renderFrame;
+    if (first) Log("SCENE_DEPTH_SETUP_READY size=%ux%u format=%u", desc.Width, desc.Height, unsigned(readFormat));
+}
+
+bool NeedsPoseFrame(const DeviceResources& res, uint64_t nowUs, bool recording, bool stomp) {
+    if (recording || stomp || effectFrame.leading || nowUs < res.playerFrontUntilUs ||
+        chargeTimeline.current.move != ChargeMove::None || airCombo.armed) return true;
+    const auto hasPose = [](const auto& poses, uint64_t lifetime) {
+        return std::any_of(poses.begin(), poses.end(), [lifetime](const PoseFrame& pose) {
+            return pose.count && renderFrame - pose.frame < lifetime;
+        });
+    };
+    return (res.chargeOrigin.count && renderFrame - res.chargeOrigin.frame < AnchorEndAge) ||
+        hasPose(res.stompOrigins, StompHoldFrames + StompFadeFrames) ||
+        hasPose(res.airOrigins, AirOriginFrames) || hasPose(res.airTrail, AirFadeFrames);
 }
 
 bool InspectDraw(Context* c, const Draw& draw) {
@@ -1197,14 +1232,20 @@ bool InspectDraw(Context* c, const Draw& draw) {
     const auto now = GetTickCount64();
     const bool capture = now < captureUntil;
     if (!capture && !settings.enabled) return false;
+    ++activity.indexed;
     const auto found = contexts.find(c);
     if (found == contexts.end()) return false;
     auto& state = found->second;
     if (!state.index || !state.vertices[0].buffer || !state.vs || state.uavsBound || state.unknownVertexSlots ||
         draw.count < 3 || draw.count > 100000) return false;
+    ++activity.stateReady;
     const auto key = MeshKey(state, draw);
     const auto* mesh = ObserveCostume(key);
     const bool selected = mesh != nullptr;
+    if (selected) {
+        ++activity.costume;
+        if (state.viewportCount == 1) activity.viewport = state.viewport;
+    }
     const bool gear = activeCostume != Costume::Unknown &&
         std::find(DragonGearMeshes.begin(), DragonGearMeshes.end(), key) != DragonGearMeshes.end();
     if (!capture && !selected && !gear) return false;
@@ -1220,6 +1261,7 @@ bool InspectDraw(Context* c, const Draw& draw) {
     }
     const bool sceneColor = state.viewportCount == 1 && state.viewport.Width >= 640 &&
         state.viewport.Height >= 360 && !state.psClasses;
+    if (selected && sceneColor) ++activity.sceneColor;
     if ((!active || (!selected && !gear) || !sceneColor) && !capture && body >= 1) return false;
 
     ComPtr<ID3D11Device> device;
@@ -1233,9 +1275,13 @@ bool InspectDraw(Context* c, const Draw& draw) {
     if (capture && sceneColor) CaptureMask(c, state, device.Get(), res, draw, key);
     if (!PrepareGhost(device.Get(), res)) return false;
     if (active && selected && sceneColor) {
-        RememberSceneDepth(device.Get(), res.sceneDepth, state.depthView, state.depthState, state.viewport);
         const bool recording = now < previewUntil || effectFrame.trailFrames || airCombo.descentCapture;
-        CapturePlayer(c, state, device.Get(), res, draw, key, nowUs, recording, stompRenderFrame == renderFrame);
+        const bool stomp = stompRenderFrame == renderFrame;
+        if (NeedsPoseFrame(res, nowUs, recording, stomp)) {
+            if (SceneDepthEnabled())
+                RememberSceneDepth(device.Get(), res.sceneDepth, state.depthView, state.depthState, state.viewport);
+            CapturePlayer(c, state, device.Get(), res, draw, key, nowUs, recording, stomp);
+        }
     } else if (active && gear && sceneColor && body > 0 && res.playerFront.frame == renderFrame) {
         CapturePart(c, state, device.Get(), res.playerFront, draw, key);
     }
@@ -1275,36 +1321,58 @@ bool InspectDraw(Context* c, const Draw& draw) {
     return true;
 }
 
-void STDMETHODCALLTYPE ObserveIndexed(Context* c, UINT count, UINT first, INT base) {
+template<class Next, class... Args>
+void ForwardIndexed(Next next, Context* c, const Draw& draw, bool inspect, Args... args) {
+    // D3D11 can forward to a second hooked entry with the original context pointer.
+    // Dispatch by the entry we intercepted, since the context vtable can still name the first.
+    if (forwardingIndexed || drawingExtra) {
+        next(c, args...);
+        return;
+    }
+    struct ForwardScope {
+        ForwardScope() { forwardingIndexed = true; }
+        ~ForwardScope() { forwardingIndexed = false; }
+    } scope;
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
-    try { if (InspectDraw(c, Draw{count, first, base})) return; }
-    catch (...) { Log("DRAW_INSPECTION_FAILED"); }
-    Original<DrawIndexed>(c, Indexed)(c, count, first, base);
-}
-
-void STDMETHODCALLTYPE ObserveIndexedInstanced(Context* c, UINT count, UINT instances, UINT first, INT base, UINT instance) {
-    std::lock_guard<std::recursive_mutex> guard(renderMutex);
-    if (instances == 1) {
-        try { if (InspectDraw(c, Draw{count, first, base, instance, true})) return; }
+    if (inspect) {
+        try { if (InspectDraw(c, draw)) return; }
         catch (...) { Log("DRAW_INSPECTION_FAILED"); }
     }
-    Original<DrawIndexedInstanced>(c, IndexedInstanced)(c, count, instances, first, base, instance);
+    next(c, args...);
 }
 
-HRESULT STDMETHODCALLTYPE ObserveFinish(Context* c, BOOL restore, ID3D11CommandList** list) {
+void ObserveIndexed(IndexedDraw next, Context* c, UINT count, UINT first, INT base) {
+    ForwardIndexed(next, c, Draw{count, first, base}, true, count, first, base);
+}
+
+void ObserveIndexedInstanced(InstancedIndexedDraw next, Context* c, UINT count, UINT instances, UINT first, INT base, UINT instance) {
+    ForwardIndexed(next, c, Draw{count, first, base, instance, true}, instances == 1,
+        count, instances, first, base, instance);
+}
+
+HRESULT ObserveFinish(FinishList next, Context* c, BOOL restore, ID3D11CommandList** list) {
+    if (drawingExtra) return next(c, restore, list);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
-    HRESULT result = Original<FinishList>(c, Finish)(c, restore, list);
+    HRESULT result = next(c, restore, list);
     auto found = contexts.find(c);
-    if (found != contexts.end() && SUCCEEDED(result) && list && *list && !found->second.readbacks.empty()) {
-        commandReadbacks[*list] = std::move(found->second.readbacks);
-        found->second.readbacks.clear();
+    if (found != contexts.end() && SUCCEEDED(result) && list && *list) {
+        if (!found->second.readbacks.empty()) {
+            commandReadbacks[*list] = std::move(found->second.readbacks);
+            found->second.readbacks.clear();
+        }
+        if (!restore) ResetContextState(found->second);
     }
     return result;
 }
 
-void STDMETHODCALLTYPE ObserveExecute(Context* c, ID3D11CommandList* list, BOOL restore) {
+void ObserveExecute(ExecuteList next, Context* c, ID3D11CommandList* list, BOOL restore) {
+    if (drawingExtra) return next(c, list, restore);
     std::lock_guard<std::recursive_mutex> guard(renderMutex);
-    Original<ExecuteList>(c, Execute)(c, list, restore);
+    next(c, list, restore);
+    if (!restore) {
+        auto state = contexts.find(c);
+        if (state != contexts.end()) ResetContextState(state->second);
+    }
     auto found = commandReadbacks.find(list);
     if (found != commandReadbacks.end() && c->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE) {
         for (const auto& readback : found->second) SaveReadback(c, readback);
@@ -1348,174 +1416,22 @@ bool PrepareOverlay(ID3D11Device* device, DeviceResources& res, const D3D11_TEXT
 
 bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D11_TEXTURE2D_DESC& backBuffer, unsigned layers) {
     if (!res.fullscreen) {
-        constexpr char fullscreen[] = R"(
-            float4 main(uint id : SV_VertexID) : SV_Position {
-                float2 uv = float2((id << 1) & 2, id & 2);
-                return float4(uv * float2(2,-2) + float2(-1,1), 0, 1);
-            })";
-        constexpr char composite[] = R"(
-            Texture2D<float4> scene : register(t0);
-            Texture2DArray<float4> parts : register(t1);
-            SamplerState linearSampler : register(s0);
-            cbuffer Refraction : register(b12) {
-                float pixels; float time; float emission; float jointOpacity;
-                float4 layerOpacity[3];
-                uint layerCount; uint playerLayer;
-                float muscleHighlight; float glassRefraction;
-                float surfaceBrightness;
-            }
-            cbuffer GhostColor : register(b13) { float4 color; }
-            float4 surfaceAt(int2 p, uint layer) {
-                float4 raw = parts.Load(int4(p, layer, 0));
-                return float4(round(raw.x * 255.0), raw.y, raw.zw * 2.0 - 1.0);
-            }
-            int partOf(float label) { return (int)label & 15; }
-            float filled(float2 surface) { return partOf(surface.x) != 0 ? 1.0 : 0.0; }
-            bool playerAt(int2 p) {
-                return playerLayer != 0xffffffff && partOf(surfaceAt(p, playerLayer).x) != 0;
-            }
-            bool connects(int a, int b) {
-                return b != 0 && ((abs(a - b) == 1 && min(a, b) != 5) ||
-                    (min(a, b) == 2 && max(a, b) == 6));
-            }
-            float4 main(float4 pos : SV_Position) : SV_Target {
-                uint w, h;
-                scene.GetDimensions(w,h);
-                int2 pixel = int2(pos.xy);
-                if (playerAt(pixel)) discard;
-                int width = max(1, (int)round(h / 430.0));
-                int edgeRadius = clamp((int)round(h / 650.0), 1, 3);
-                float alpha = 0;
-                float3 light = 0;
-                float3 blue = color.rgb * float3(0.70, 0.83, 1.0);
-                float2 size = float2(w,h);
-                float3 original = scene.Load(int3(pixel, 0)).rgb;
-                float3 glassColor = original;
-                [loop] for (uint i = 0; i < layerCount; ++i) {
-                    float4 surface = surfaceAt(pixel, i);
-                    int part = partOf(surface.x);
-                    if (part == 0) continue;
-                    float4 left = surfaceAt(pixel - int2(width,0), i);
-                    float4 right = surfaceAt(pixel + int2(width,0), i);
-                    float4 top = surfaceAt(pixel - int2(0,width), i);
-                    float4 bottom = surfaceAt(pixel + int2(0,width), i);
-                    float opacity = layerOpacity[i / 4][i % 4];
-                    if (jointOpacity < 1 &&
-                        (connects(part, partOf(left.x)) || connects(part, partOf(right.x)) ||
-                         connects(part, partOf(top.x)) || connects(part, partOf(bottom.x)))) opacity *= jointOpacity;
-                    // Smooth shading only within the same anatomical part and material.
-                    float4 neighbors = float4(left.y, right.y, top.y, bottom.y);
-                    float4 labels = float4(left.x, right.x, top.x, bottom.x);
-                    float4 weights = 1 - saturate(abs(labels - surface.x));
-                    float brightness = (3 * surface.y + dot(neighbors, weights)) /
-                        (3 + dot(weights, float4(1, 1, 1, 1)));
-                    // Reduce coverage at the silhouette, especially at convex
-                    // corners. Internal material and anatomical seams stay solid.
-                    int2 x = int2(edgeRadius,0), y = int2(0,edgeRadius);
-                    float sides = edgeRadius == width ? filled(left.xy) + filled(right.xy) + filled(top.xy) + filled(bottom.xy) :
-                        filled(surfaceAt(pixel-x,i).xy) + filled(surfaceAt(pixel+x,i).xy) +
-                        filled(surfaceAt(pixel-y,i).xy) + filled(surfaceAt(pixel+y,i).xy);
-                    if (sides < 4) {
-                        float corners = filled(surfaceAt(pixel-x-y,i).xy) + filled(surfaceAt(pixel+x-y,i).xy) +
-                            filled(surfaceAt(pixel-x+y,i).xy) + filled(surfaceAt(pixel+x+y,i).xy);
-                        float edge = (4.0 + 2.0 * sides + corners) / 16.0;
-                        opacity *= lerp(0.35, 1.0, smoothstep(0.20, 0.98, edge));
-                    }
-                    if (glassRefraction >= 0) {
-                        // The shape bends the scene behind it. A weak lavender
-                        // tint remains where the angle gives little refraction.
-                        float4 normalWeights = float4(filled(left.xy), filled(right.xy),
-                            filled(top.xy), filled(bottom.xy));
-                        float2 direction = (surface.zw * 3 + left.zw * normalWeights.x + right.zw * normalWeights.y +
-                            top.zw * normalWeights.z + bottom.zw * normalWeights.w) /
-                            (3 + dot(normalWeights, float4(1,1,1,1)));
-                        float bend = saturate(length(direction));
-                        float rim = saturate((4 - sides) * 0.25);
-                        float2 shifted = clamp(pos.xy - direction * glassRefraction * (h / 720.0),
-                            float2(0.5,0.5), size - 0.5);
-                        int2 source = int2(floor(shifted - 0.5));
-                        bool touchesPlayer = playerAt(source) || playerAt(source + int2(1,0)) ||
-                            playerAt(source + int2(0,1)) || playerAt(source + int2(1,1));
-                        float3 bent = touchesPlayer ? original : scene.SampleLevel(linearSampler, shifted / size, 0).rgb;
-                        float transmission = saturate(opacity * (1.35 + 1.18 * bend));
-                        glassColor = lerp(glassColor, bent, transmission);
-                        float3 lavender = lerp(color.rgb, float3(0.64, 0.59, 0.84), 0.47);
-                        float frost = opacity * (0.16 + 0.30 * (1 - bend) + 0.22 * rim);
-                        float skin = ((int)surface.x >> 4) == 2 ? muscleHighlight : 0.25;
-                        float glint = opacity * emission * (0.11 + 0.32 * rim + 0.24 * bend * bend + 0.14 * brightness * skin);
-                        glassColor = glassColor * (1 - frost) + lavender * frost * 0.70 * surfaceBrightness +
-                            lerp(lavender, float3(0.91,0.90,1.0), 0.37 * bend) * glint;
-                        alpha += opacity;
-                        continue;
-                    }
-                    float coverage = opacity * (0.44 + 0.48 * brightness);
-                    float highlight = ((int)surface.x >> 4) == 2 ? muscleHighlight : 1.0;
-                    float3 tone = lerp(blue, float3(0.97, 0.96, 1.0), smoothstep(0.64, 0.95, brightness) * highlight);
-                    float energy = opacity * emission * (0.11 + 1.72 * brightness * brightness) * highlight;
-                    light = tone * (coverage + energy) + light * (1 - coverage);
-                    alpha = coverage + alpha * (1 - coverage);
-                }
-                if (alpha <= 0) discard;
-                if (glassRefraction >= 0) return float4(glassColor, 1);
-                if (pixels <= 0) return float4(original * (1 - alpha) + light, 1);
-                float2 p = pos.xy * (720.0 / h);
-                float2 wave = float2(sin(p.y * 0.055 + time), cos(p.x * 0.05 - time));
-                float2 shift = wave * (pixels * max(0.5, h / 720.0));
-                float2 shifted = pos.xy + shift;
-                int2 source = int2(floor(shifted - 0.5));
-                bool touchesPlayer = playerAt(source) || playerAt(source + int2(1,0)) ||
-                    playerAt(source + int2(0,1)) || playerAt(source + int2(1,1));
-                float3 bent = touchesPlayer ? original : scene.SampleLevel(linearSampler, shifted / size, 0).rgb;
-                float3 glass = lerp(original, bent, saturate(alpha * 1.5));
-                return float4(glass * (1 - alpha) + light, 1);
-            })";
-        ComPtr<ID3DBlob> code;
-        const std::string partLighting = std::string(SceneOcclusion) + R"(
-            cbuffer Part : register(b11) { float id; float minimum; float range; }
-            cbuffer Viewport : register(b12) { float invHeight; }
-            float4 surface(float4 pos, float label, float low, float span) {
-                occlude(pos);
-                float z = rcp(max(abs(pos.w), 0.0001));
-                float3 normal = normalize(float3(-ddx(z), ddy(z), z * invHeight * 1.1));
-                float diffuse = pow(saturate(dot(normal, float3(-0.42, 0.44, 0.794))), 1.35);
-                float grazing = 1.0 - normal.z;
-                float level = saturate(low + span * (diffuse * 0.76 + grazing * 0.24));
-                return float4(label / 255.0, level, normal.xy * 0.5 + 0.5);
-            })";
-        const std::string part = std::string(partLighting) + R"(
-            float4 main(float4 pos : SV_Position) : SV_Target { return surface(pos, id, minimum, range); }
-        )";
-        // Only the finger and palm islands of albedo 21 contain skin.
-        const std::string glove = std::string(partLighting) + R"(
-            float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-                uv = frac(uv);
-                bool fingers = uv.x < 0.5 && uv.y < 0.5 && (uv.x >= 0.25 || uv.y >= 0.25);
-                bool thumb = uv.x >= 0.875 && uv.y < 0.125;
-                bool skin = fingers || thumb;
-                return surface(pos, skin ? id + 16 : id, skin ? 0.72 : minimum, skin ? 0.28 : range);
-            }
-        )";
-        const std::string grip = std::string(partLighting) + GripSkinMask + R"(
-            float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-                bool skin = gripSkin(uv);
-                return surface(pos, skin ? id + 16 : id, skin ? 0.72 : minimum, skin ? 0.28 : range);
-            }
-        )";
-        if (FAILED(D3DCompile(fullscreen, sizeof(fullscreen) - 1, nullptr, nullptr, nullptr, "main", "vs_5_0",
-                D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, code.GetAddressOf(), nullptr)) ||
-            !CreateShader(device, composite, res.composite) || !CreateShader(device, part.c_str(), res.partShader) ||
-            !CreateShader(device, glove.c_str(), res.gloveShader) ||
-            !CreateShader(device, grip.c_str(), res.gripShader)) return false;
+        // Device object creation can fail partway through. Commit only when complete.
+        RefractionResources prepared;
+        if (!CreatePixelShader(device, AfterimageShaders::Composite, prepared.composite) ||
+            !CreatePixelShader(device, AfterimageShaders::Part, prepared.partShader) ||
+            !CreatePixelShader(device, AfterimageShaders::Glove, prepared.gloveShader) ||
+            !CreatePixelShader(device, AfterimageShaders::Grip, prepared.gripShader)) return false;
         D3D11_BUFFER_DESC labels{};
         labels.ByteWidth = 16;
         labels.Usage = D3D11_USAGE_IMMUTABLE;
         labels.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         constexpr float MaterialLevels[][2]{{0.16f, 0.44f}, {0.12f, 0.34f}, {0.72f, 0.28f}};
-        for (unsigned i = 0; i < res.partLabels.size(); ++i) {
+        for (unsigned i = 0; i < prepared.partLabels.size(); ++i) {
             const auto& level = MaterialLevels[i / 8];
             const FLOAT id[4]{float(i % 8 + 1 + 16 * (i / 8)), level[0], level[1]};
             D3D11_SUBRESOURCE_DATA initial{id, 0, 0};
-            if (FAILED(device->CreateBuffer(&labels, &initial, res.partLabels[i].GetAddressOf()))) return false;
+            if (FAILED(device->CreateBuffer(&labels, &initial, prepared.partLabels[i].GetAddressOf()))) return false;
         }
         D3D11_BUFFER_DESC parameters{};
         parameters.ByteWidth = 16 + MaxGhostLayers * 4 + 32;
@@ -1533,12 +1449,14 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
         D3D11_BLEND_DESC blend{};
         blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED |
             D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
-        if (FAILED(device->CreateDepthStencilState(&depth, res.partDepth.GetAddressOf())) ||
-            FAILED(device->CreateBuffer(&parameters, nullptr, res.parameters.GetAddressOf())) ||
-            FAILED(device->CreateSamplerState(&sampler, res.linearSampler.GetAddressOf())) ||
-            FAILED(device->CreateBlendState(&blend, res.rgbBlend.GetAddressOf())) ||
-            FAILED(device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr,
-                res.fullscreen.GetAddressOf()))) return false;
+        if (FAILED(device->CreateDepthStencilState(&depth, prepared.partDepth.GetAddressOf())) ||
+            FAILED(device->CreateBuffer(&parameters, nullptr, prepared.parameters.GetAddressOf())) ||
+            FAILED(device->CreateSamplerState(&sampler, prepared.linearSampler.GetAddressOf())) ||
+            FAILED(device->CreateBlendState(&blend, prepared.rgbBlend.GetAddressOf())) ||
+            FAILED(device->CreateVertexShader(AfterimageShaders::Fullscreen, sizeof(AfterimageShaders::Fullscreen), nullptr,
+                prepared.fullscreen.GetAddressOf()))) return false;
+        res = std::move(prepared);
+        Log("REFRACTION_PIPELINE_READY");
     }
     const bool sameSize = res.scene && res.surface.Width == backBuffer.Width &&
         res.surface.Height == backBuffer.Height && res.surface.Format == backBuffer.Format;
@@ -1631,6 +1549,22 @@ void DrawOverlayPart(Context* c, const OverlayDraw& packet, ID3D11Buffer* camera
     CallDraw(c, packet.draw);
 }
 
+
+void ReadOverlayCoverage(Context* immediate, OverlayCoverageProbe& probe) {
+    if (!probe.pending) return;
+    UINT64 geometry = 0, composite = 0;
+    const auto mask = immediate->GetData(probe.geometry.Get(), &geometry, sizeof(geometry), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    const auto output = immediate->GetData(probe.composite.Get(), &composite, sizeof(composite), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    if (mask == S_FALSE || output == S_FALSE) return;
+    probe.pending = false;
+    if (mask == S_OK && output == S_OK)
+        Log("OVERLAY_COVERAGE frame=%llu draws=%u depth=%u geometry=%llu composite=%llu",
+            static_cast<unsigned long long>(probe.frame), probe.draws, unsigned(probe.sceneDepth),
+            static_cast<unsigned long long>(geometry), static_cast<unsigned long long>(composite));
+    else
+        Log("OVERLAY_COVERAGE_UNAVAILABLE mask=%08lx output=%08lx", mask, output);
+}
+
 bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& res) {
     ComPtr<ID3D11Texture2D> backBuffer;
     ComPtr<ID3D11RenderTargetView> target;
@@ -1663,7 +1597,7 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
     auto* c = res.overlayContext.Get();
     auto& refraction = res.refraction;
     const auto& sceneDepth = res.sceneDepth;
-    const bool hasSceneDepth = sceneDepth.frame == renderFrame && sceneDepth.view;
+    const bool hasSceneDepth = SceneDepthEnabled() && sceneDepth.frame == renderFrame && sceneDepth.view;
     const bool playerFront = res.playerFront.frame == renderFrame && res.playerFront.count;
     bool useRefraction = desc.SampleDesc.Count == 1 && !refraction.unavailable && layerCount <= MaxGhostLayers;
     if (useRefraction && !PrepareRefraction(device, refraction, desc, layerCount + unsigned(playerFront))) {
@@ -1699,6 +1633,20 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
         c->UpdateSubresource(lighting, 0, nullptr, projection, 0, 0);
     }
     c->RSSetState(res.overlayRasterizer.Get());
+    auto& probe = res.coverageProbe;
+    const bool probeThisFrame = useRefraction && !probe.pending && probe.samples < 6 &&
+        (!probe.frame || renderFrame - probe.frame >= 45);
+    if (probeThisFrame) {
+        ++probe.samples;
+        probe.frame = renderFrame;
+        if (!probe.geometry || !probe.composite) {
+            const D3D11_QUERY_DESC query{D3D11_QUERY_OCCLUSION, 0};
+            if (FAILED(device->CreateQuery(&query, probe.geometry.ReleaseAndGetAddressOf())) ||
+                FAILED(device->CreateQuery(&query, probe.composite.ReleaseAndGetAddressOf()))) probe.samples = 6;
+        }
+    }
+    const bool measure = probeThisFrame && probe.geometry && probe.composite;
+    if (measure) c->Begin(probe.geometry.Get());
     const OverlayDraw* previous = nullptr;
     std::array<float, MaxGhostLayers> opacities{};
     float lastOpacity = -1;
@@ -1748,6 +1696,7 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
         }
         DrawOverlayPart(c, packet, nullptr);
     }
+    if (measure) c->End(probe.geometry.Get());
     if (playerFront) {
         if (partShader != refraction.partShader.Get())
             Original<SetPS>(c, PsShader)(c, refraction.partShader.Get(), nullptr, 0);
@@ -1761,10 +1710,17 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
         for (unsigned i = 0; i < res.playerFront.count; ++i)
             DrawOverlayPart(c, res.playerFront.parts[i], res.frameCamera.Get());
     }
+    if (measure) c->Begin(probe.composite.Get());
     if (useRefraction) CompositeRefraction(c, res, target.Get(), poses, opacities, playerFront);
+    if (measure) c->End(probe.composite.Get());
     ComPtr<ID3D11CommandList> list;
     if (FAILED(Original<FinishList>(c, Finish)(c, FALSE, list.GetAddressOf())) || !list) return false;
     Original<ExecuteList>(immediate.Get(), Execute)(immediate.Get(), list.Get(), TRUE);
+    if (measure) {
+        probe.draws = static_cast<unsigned>(draws.size());
+        probe.sceneDepth = hasSceneDepth;
+        probe.pending = true;
+    }
     if (loggedOverlays++ < 16)
         Log("OVERLAY_DRAW frame=%llu draws=%u poses=%u backbuffer=%ux%u brightness=%u emission=%u refraction=%u segmented=%u player_front=%u style=%s scene_depth=%ux%u frozen=%u",
             static_cast<unsigned long long>(renderFrame), static_cast<unsigned>(draws.size()), poses, desc.Width,
@@ -1776,13 +1732,19 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
     return true;
 }
 
-HRESULT STDMETHODCALLTYPE ObservePresent(IDXGISwapChain* swap, UINT syncInterval, UINT flags) {
+HRESULT ObservePresent(Present next, IDXGISwapChain* swap, UINT syncInterval, UINT flags) {
     // A windowed swap chain can keep presenting after another window gains focus.
     if (hooksReady && swap == gameSwap && !(flags & DXGI_PRESENT_TEST)) {
         std::lock_guard<std::recursive_mutex> guard(renderMutex);
+        ++activity.presented;
         for (auto& entry : resources) {
             auto& res = entry.second;
             try {
+                if (res.coverageProbe.pending) {
+                    ComPtr<Context> immediate;
+                    entry.first->GetImmediateContext(immediate.GetAddressOf());
+                    if (immediate) ReadOverlayCoverage(immediate.Get(), res.coverageProbe);
+                }
                 if (settings.enabled) BuildOverlayDraws(res, PoseClockUs());
                 if (res.overlayDraws.empty()) continue;
                 if (settings.enabled && !RenderOverlay(swap, entry.first, res) && loggedOverlays++ < 16)
@@ -1794,97 +1756,212 @@ HRESULT STDMETHODCALLTYPE ObservePresent(IDXGISwapChain* swap, UINT syncInterval
         }
         ++renderFrame;
     }
-    return originalPresent(swap, syncInterval, flags);
+    return next(swap, syncInterval, flags);
 }
 
-struct Hook { Slot slot; void* handler; };
-const Hook hooks[]{
-    {VsConstants, reinterpret_cast<void*>(TrackVSConstants)},
-    {VertexBuffers, reinterpret_cast<void*>(TrackVertex)}, {IndexBuffer, reinterpret_cast<void*>(TrackIndex)},
-    {InputLayout, reinterpret_cast<void*>(TrackLayout)}, {Topology, reinterpret_cast<void*>(TrackTopology)},
-    {PsShader, reinterpret_cast<void*>(TrackPS)}, {VsShader, reinterpret_cast<void*>(TrackVS)},
-    {Targets, reinterpret_cast<void*>(TrackTargets)}, {TargetsAndUavs, reinterpret_cast<void*>(TrackTargetsUav)},
-    {Blend, reinterpret_cast<void*>(TrackBlend)}, {Depth, reinterpret_cast<void*>(TrackDepth)},
-    {ClearDepthView, reinterpret_cast<void*>(ObserveClearDepth)},
-    {Viewports, reinterpret_cast<void*>(TrackViewport)}, {Clear, reinterpret_cast<void*>(TrackClear)},
-    {Indexed, reinterpret_cast<void*>(ObserveIndexed)}, {IndexedInstanced, reinterpret_cast<void*>(ObserveIndexedInstanced)},
-    {Finish, reinterpret_cast<void*>(ObserveFinish)}, {Execute, reinterpret_cast<void*>(ObserveExecute)}
+constexpr size_t ContextHookCount = 18;
+constexpr size_t MaxContextTables = 16;
+struct ContextHook {
+    Slot index;
+    std::array<void*, MaxContextTables> handlers;
 };
+std::array<RenderVtable::Slot, MaxContextTables * ContextHookCount> contextEntries{};
+std::array<std::atomic<bool>, MaxContextTables * ContextHookCount> retiredContextEntries{};
+std::array<std::atomic<void*>, MaxContextTables * ContextHookCount> contextOriginals{};
+std::array<RenderVtable::Slot, 1> presentEntries{};
+std::array<RenderVtable::Slot, 1> deviceEntries{};
+std::array<void**, MaxContextTables> contextTables{};
+std::array<ComPtr<Context>, MaxContextTables> contextTableOwners;
+
+template<size_t position, class Fn, auto Observe, size_t... rows>
+auto ContextObservers(std::index_sequence<rows...>) {
+    using Observer = RenderVtable::Observer<Fn, Observe>;
+    return std::array<void*, MaxContextTables>{
+        reinterpret_cast<void*>(Observer::template Call<contextEntries, rows * ContextHookCount + position>)...
+    };
+}
+
+template<size_t position, class Fn, auto Observe>
+ContextHook MakeContextHook(Slot index) {
+    return {index, ContextObservers<position, Fn, Observe>(std::make_index_sequence<MaxContextTables>{})};
+}
+
+const ContextHook contextHooks[]{
+    MakeContextHook<0, SetBuffers, TrackVSConstants>(VsConstants),
+    MakeContextHook<1, SetVertex, TrackVertex>(VertexBuffers),
+    MakeContextHook<2, SetIndex, TrackIndex>(IndexBuffer),
+    MakeContextHook<3, SetLayout, TrackLayout>(InputLayout),
+    MakeContextHook<4, SetTopology, TrackTopology>(Topology),
+    MakeContextHook<5, SetPS, TrackPS>(PsShader),
+    MakeContextHook<6, SetVS, TrackVS>(VsShader),
+    MakeContextHook<7, SetTargets, TrackTargets>(Targets),
+    MakeContextHook<8, SetTargetsUav, TrackTargetsUav>(TargetsAndUavs),
+    MakeContextHook<9, SetBlend, TrackBlend>(Blend),
+    MakeContextHook<10, SetDepth, TrackDepth>(Depth),
+    MakeContextHook<11, SetViewport, TrackViewport>(Viewports),
+    MakeContextHook<12, ClearDepth, ObserveClearDepth>(ClearDepthView),
+    MakeContextHook<13, ClearContext, TrackClear>(Clear),
+    MakeContextHook<14, FinishList, ObserveFinish>(Finish),
+    MakeContextHook<15, ExecuteList, ObserveExecute>(Execute),
+    MakeContextHook<16, IndexedDraw, ObserveIndexed>(Indexed),
+    MakeContextHook<17, InstancedIndexedDraw, ObserveIndexedInstanced>(IndexedInstanced)
+};
+static_assert(std::size(contextHooks) == ContextHookCount);
 
 bool HasSharedContextHook(Context* context, Slot slot) {
-    return hooksReady && sharedRenderTargets.count((*reinterpret_cast<void***>(context))[slot]);
+    return hooksReady && sharedRenderSlots.count(RenderVtable::Table(context) + slot);
 }
 
 const AfterimageDrawHandlers sharedDrawHandlers{
-    [](Context* c, UINT count, UINT first, INT base) {
+    [](IndexedDraw next, Context* c, UINT count, UINT first, INT base) {
         std::lock_guard<std::recursive_mutex> guard(renderMutex);
         if (!HasSharedContextHook(c, Indexed)) return false;
-        ObserveIndexed(c, count, first, base);
+        ObserveIndexed(next, c, count, first, base);
         return true;
     },
-    [](Context* c, UINT count, UINT instances, UINT first, INT base, UINT instance) {
+    [](InstancedIndexedDraw next, Context* c, UINT count, UINT instances, UINT first, INT base, UINT instance) {
         std::lock_guard<std::recursive_mutex> guard(renderMutex);
         if (!HasSharedContextHook(c, IndexedInstanced)) return false;
-        ObserveIndexedInstanced(c, count, instances, first, base, instance);
+        ObserveIndexedInstanced(next, c, count, instances, first, base, instance);
         return true;
     },
-    [](Context* c, ID3D11CommandList* list, BOOL restore) {
+    [](ExecuteDrawList next, Context* c, ID3D11CommandList* list, BOOL restore) {
         std::lock_guard<std::recursive_mutex> guard(renderMutex);
         if (!HasSharedContextHook(c, Execute)) return false;
-        ObserveExecute(c, list, restore);
+        ObserveExecute(next, c, list, restore);
         return true;
     }
 };
 
-bool BindRenderHooks(ID3D11Device* device, Context* immediate, IDXGISwapChain* swap) {
-    ComPtr<Context> deferred;
-    if (FAILED(device->CreateDeferredContext(0, deferred.GetAddressOf()))) return false;
-    auto* present = (*reinterpret_cast<void***>(swap))[8];
-    void* nextPresent = nullptr;
-    if (MH_CreateHook(present, reinterpret_cast<void*>(ObservePresent), &nextPresent) != MH_OK) {
-        Log("PRESENT_HOOK_FAILED");
-        return false;
+bool RebindContextSlot(const RenderVtable::Slot& entry) {
+    if (!entry.address || entry.retired->load()) return false;
+    void* current = *entry.address;
+    if (current == entry.observer) return false;
+    const auto previous = entry.Next();
+    if (current != previous) {
+        MEMORY_BASIC_INFORMATION oldCode{}, newCode{};
+        if (!VirtualQuery(entry.original, &oldCode, sizeof(oldCode)) ||
+            !VirtualQuery(current, &newCode, sizeof(newCode)) || newCode.Type != MEM_IMAGE ||
+            oldCode.AllocationBase != newCode.AllocationBase ||
+            !(newCode.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+            return false;
+        entry.currentOriginal->store(current);
     }
-    originalPresent = reinterpret_cast<Present>(nextPresent);
-    std::vector<void*> ownedTargets;
-    auto rollback = [&] {
-        MH_RemoveHook(present);
-        for (auto target : ownedTargets) MH_RemoveHook(target);
-        originals.clear();
-        sharedRenderTargets.clear();
-        return false;
-    };
-    for (auto c : {immediate, deferred.Get()}) {
-        auto table = *reinterpret_cast<void***>(c);
-        for (const auto& hook : hooks) {
-            void* target = table[hook.slot];
-            if (originals.count(target)) continue;
-            if (controllerHooks.original) {
-                if (auto* next = controllerHooks.original(target, hook.slot)) {
-                    originals.emplace(target, next);
-                    sharedRenderTargets.insert(target);
-                    continue;
-                }
-            }
-            void* next = nullptr;
-            auto status = MH_CreateHook(target, hook.handler, &next);
-            if (status != MH_OK) {
-                Log("HOOK_FAILED slot=%u status=%s", unsigned(hook.slot), MH_StatusToString(status));
-                return rollback();
-            }
-            originals.emplace(target, next);
-            ownedTargets.push_back(target);
+    if (entry.Exchange(current, entry.observer)) return true;
+    entry.currentOriginal->store(previous);
+    return false;
+}
+
+bool AttachContext(Context* context, const char* source) {
+    if (!context) return false;
+    auto** table = RenderVtable::Table(context);
+    const auto known = std::find(contextTables.begin(), contextTables.end(), table);
+    if (known != contextTables.end()) {
+        const size_t row = known - contextTables.begin();
+        for (size_t i = 0; i < ContextHookCount; ++i) {
+            if (RebindContextSlot(contextEntries[row * ContextHookCount + i])) ++activity.rebound;
         }
+        return true;
     }
-    if (MH_QueueEnableHook(present) != MH_OK) return rollback();
-    for (auto target : ownedTargets)
-        if (MH_QueueEnableHook(target) != MH_OK) return rollback();
-    if (MH_ApplyQueued() != MH_OK) return rollback();
+    const auto free = std::find(contextTables.begin(), contextTables.end(), nullptr);
+    if (free == contextTables.end()) return false;
+    const size_t row = free - contextTables.begin();
+    std::vector<const RenderVtable::Slot*> pending;
+    for (size_t i = 0; i < ContextHookCount; ++i) {
+        const auto& hook = contextHooks[i];
+        void** address = table + hook.index;
+        // Automatic Intel mode never intercepts the clear implicated by the crash.
+        if (intelAdapter && settings.sceneDepthMode != 2 && hook.index == ClearDepthView) continue;
+        if (controllerHooks.original && controllerHooks.original(table, hook.index)) {
+            if (hook.index == Indexed || hook.index == IndexedInstanced || hook.index == Execute)
+                sharedRenderSlots.insert(address);
+            continue;
+        }
+        const size_t position = row * ContextHookCount + i;
+        auto& entry = contextEntries[position];
+        entry = {address, *address, hook.handlers[row], hook.index, Log, &retiredContextEntries[position],
+            &contextOriginals[position]};
+        entry.retired->store(false);
+        entry.currentOriginal->store(entry.original);
+        originals.emplace(address, &entry);
+        pending.push_back(&entry);
+    }
+    size_t installed = 0;
+    for (const auto* entry : pending) {
+        if (!entry->Exchange(entry->original, entry->observer)) {
+            Log("RENDER_VTABLE_INSTALL_FAILED slot=%u context=%zu", entry->index, row);
+            while (installed) pending[--installed]->Restore();
+            for (const auto& candidate : contextHooks) {
+                originals.erase(table + candidate.index);
+                sharedRenderSlots.erase(table + candidate.index);
+            }
+            return false;
+        }
+        ++installed;
+    }
+    contextTables[row] = table;
+    contextTableOwners[row] = context;
+    Log("CONTEXT_VTABLE_READY source=%s type=%u table=%p context=%zu", source, unsigned(context->GetType()),
+        static_cast<void*>(table), row);
+    return true;
+}
+
+bool ObservePrepareGameDraw(void* renderer, int topology) {
+    // The game applies its dirty pipeline state here, immediately before submitting a draw.
+    if (hooksReady) {
+        auto* context = *reinterpret_cast<Context* const*>(static_cast<const BYTE*>(renderer) + GameContextOffset);
+        std::lock_guard<std::recursive_mutex> guard(renderMutex);
+        ++activity.prepared;
+        AttachContext(context, "game-draw");
+        return originalPrepareGameDraw(renderer, topology);
+    }
+    return originalPrepareGameDraw(renderer, topology);
+}
+
+// Some runtime implementations allocate a different dispatch table for each deferred context.
+// A context created by the patch would therefore be the wrong table to observe.
+HRESULT ObserveCreateDeferred(CreateDeferred next, ID3D11Device* device, UINT flags, Context** context) {
+    const HRESULT result = next(device, flags, context);
+    if (SUCCEEDED(result) && context && *context && hooksReady && !drawingExtra) {
+        std::lock_guard<std::recursive_mutex> guard(renderMutex);
+        AttachContext(*context, "device-create");
+    }
+    return result;
+}
+
+bool BindRenderHooks(ID3D11Device* device, Context* immediate, IDXGISwapChain* swap) {
+    ComPtr<IDXGIDevice> dxgi;
+    ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC adapterDesc{};
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(dxgi.GetAddressOf()))) &&
+        SUCCEEDED(dxgi->GetAdapter(adapter.GetAddressOf())) && SUCCEEDED(adapter->GetDesc(&adapterDesc))) {
+        intelAdapter = adapterDesc.VendorId == 0x8086;
+        Log("RENDER_ADAPTER vendor=%04x device=%04x revision=%u feature_level=%x scene_depth=%u",
+            adapterDesc.VendorId, adapterDesc.DeviceId, adapterDesc.Revision,
+            unsigned(device->GetFeatureLevel()), unsigned(SceneDepthEnabled()));
+    } else {
+        Log("RENDER_ADAPTER_UNKNOWN");
+    }
+    auto* present = RenderVtable::Table(swap) + 8;
+    presentEntries[0] = {present, *present,
+        reinterpret_cast<void*>(RenderVtable::Observer<Present, ObservePresent>::Call<presentEntries, 0>), 8, Log};
+    auto* create = RenderVtable::Table(device) + 27;
+    deviceEntries[0] = {create, *create,
+        reinterpret_cast<void*>(RenderVtable::Observer<CreateDeferred, ObserveCreateDeferred>::Call<deviceEntries, 0>), 27, Log};
+
+    if (!AttachContext(immediate, "game-frame")) return false;
+    if (!presentEntries[0].Exchange(presentEntries[0].original, presentEntries[0].observer) ||
+        !deviceEntries[0].Exchange(deviceEntries[0].original, deviceEntries[0].observer)) {
+        presentEntries[0].Restore();
+        for (const auto& entry : contextEntries)
+            if (entry.address) entry.Restore();
+        return false;
+    }
     gameSwap = swap;
     hooksReady = true;
-    if (!sharedRenderTargets.empty() && controllerHooks.connect) controllerHooks.connect(&sharedDrawHandlers);
-    Log("RENDERER_READY hooks=%u shared=%u present=%p", unsigned(originals.size()),
-        unsigned(sharedRenderTargets.size()), present);
+    if (!sharedRenderSlots.empty() && controllerHooks.connect) controllerHooks.connect(&sharedDrawHandlers);
+    Log("RENDERER_READY mode=vtable slots=%u shared=%u depth_clear=%u present=%p", unsigned(originals.size()),
+        unsigned(sharedRenderSlots.size()), unsigned(SceneDepthEnabled()), presentEntries[0].original);
     return true;
 }
 
@@ -1892,19 +1969,29 @@ void ObserveGameFrame(void* renderer, void* options) {
     // The verified game's frame routine owns the actual device and swap chain.
     // Creating a second swap chain through a proxy can replace its game window.
     const auto* data = static_cast<const BYTE*>(renderer);
-    auto* swap = *reinterpret_cast<IDXGISwapChain* const*>(data + 0x3080);
-    if (swap != gameSwap) {
+    auto* swap = *reinterpret_cast<IDXGISwapChain* const*>(data + GameSwapOffset);
+    auto* immediate = *reinterpret_cast<Context* const*>(data + GameContextOffset);
+    if (swap && immediate) {
         std::lock_guard<std::recursive_mutex> guard(renderMutex);
         static bool attempted = false;
-        if (!attempted && swap) {
-            auto* device = *reinterpret_cast<ID3D11Device* const*>(data + 0x3078);
-            auto* immediate = *reinterpret_cast<Context* const*>(data + 0x10);
-            if (device && immediate) {
+        if (!attempted) {
+            auto* device = *reinterpret_cast<ID3D11Device* const*>(data + GameDeviceOffset);
+            if (device) {
                 attempted = true;
                 if (!BindRenderHooks(device, immediate, swap)) Log("INITIALIZATION_FAILED");
             }
-        } else if (hooksReady) {
+        }
+        if (hooksReady) {
+            // The runtime can replace an immediate context's dispatch table after creation.
+            AttachContext(immediate, "game-frame");
+            // The game's worker records the scene on a context created before auto-injection.
+            if (gameWorkerLayoutVerified) {
+                const auto* worker = *reinterpret_cast<const BYTE* const*>(data + RendererWorkerOffset);
+                if (worker)
+                    AttachContext(*reinterpret_cast<Context* const*>(worker + GameContextOffset), "game-worker");
+            }
             gameSwap = swap;
+            if (gameBase && settings.enabled && activeCostume != Costume::Unknown) UpdateAction();
         }
     }
     originalGameFrame(renderer, options);
@@ -1919,6 +2006,10 @@ bool InstallHooks(GameCompatibility::Kind kind) {
     auto* frame = reinterpret_cast<BYTE*>(gameBase + FrameRoutine);
     char hash[65]{};
     if (!GameCompatibility::Sha256(frame, FrameRoutineSize, hash) || strcmp(hash, frameHash) != 0) return false;
+    const auto* workerSetup = reinterpret_cast<const BYTE*>(gameBase + 0x27a1c);
+    gameWorkerLayoutVerified = GameCompatibility::Sha256(workerSetup, 0x9b, hash) &&
+        strcmp(hash, "2FB71D01ED3C778EF6FB8F0B5053B3C63D9644ABAFBAE3B8C82CC7519CB9E504") == 0;
+    if (!gameWorkerLayoutVerified) Log("GAME_WORKER_LAYOUT_UNVERIFIED");
     const auto init = MH_Initialize();
     if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) return false;
     void* next = nullptr;
@@ -1930,6 +2021,20 @@ bool InstallHooks(GameCompatibility::Kind kind) {
         MH_RemoveHook(frame);
         return false;
     }
+    constexpr uintptr_t PrepareDrawRoutine = 0x4b010;
+    constexpr size_t PrepareDrawRoutineSize = 0x60;
+    auto* prepareDraw = reinterpret_cast<BYTE*>(gameBase + PrepareDrawRoutine);
+    if (GameCompatibility::Sha256(prepareDraw, PrepareDrawRoutineSize, hash) &&
+        strcmp(hash, "DCA8EC21B05326EA087439A60CFEDD7BE511406AE46AF5C8D4B060584F2D00F9") == 0 &&
+        MH_CreateHook(prepareDraw, reinterpret_cast<void*>(ObservePrepareGameDraw), &next) == MH_OK) {
+        originalPrepareGameDraw = reinterpret_cast<PrepareGameDraw>(next);
+        if (MH_EnableHook(prepareDraw) == MH_OK) {
+            Log("GAME_DRAW_HOOK_READY rva=%zx", size_t(PrepareDrawRoutine));
+            return true;
+        }
+        MH_RemoveHook(prepareDraw);
+    }
+    Log("GAME_DRAW_HOOK_UNAVAILABLE");
     return true;
 }
 
@@ -1953,6 +2058,10 @@ void ReadSettings() {
     settings.autoWallDownslash = ReadNumber(L"AutomaticWallDownslash", 1, 0, 1) != 0;
     settings.autoSwallow = ReadNumber(L"AutomaticFlyingSwallow", 1, 0, 1) != 0;
     settings.autoWhiteFeather = ReadNumber(L"AutomaticWhiteFeather", 1, 0, 1) != 0;
+    const auto previousDepthMode = settings.sceneDepthMode;
+    settings.sceneDepthMode = ReadNumber(L"SceneDepthMode", 0, 0, 2);
+    if (previousDepthMode != settings.sceneDepthMode)
+        Log("SCENE_DEPTH_MODE config=%u enabled=%u", settings.sceneDepthMode, unsigned(SceneDepthEnabled()));
     settings.interval = ReadNumber(L"IntervalMs", 12, 6, 150);
     settings.lifetime = ReadNumber(L"LifetimeMs", 185, 65, 650);
     settings.copies = ReadNumber(L"Copies", 5, 1, 5);
@@ -2031,6 +2140,7 @@ unsigned PlayerScript(uintptr_t base, float& motionFrame) {
 DWORD WINAPI PollAfterimage(void*) {
     unsigned lastRead = 0;
     unsigned lastReport = 0;
+    unsigned lastRenderReport = GetTickCount();
     bool wasPreviewKey = false;
     bool wasStopKey = false;
     for (;;) {
@@ -2067,6 +2177,16 @@ DWORD WINAPI PollAfterimage(void*) {
                 samples = intervalTotalUs = intervalCount = 0;
             }
         }
+        if (now - lastRenderReport >= 8000) {
+            lastRenderReport = now;
+            std::lock_guard<std::recursive_mutex> guard(renderMutex);
+            if (hooksReady && settings.enabled) {
+                Log("RENDER_ACTIVITY present=%llu indexed=%llu state_ready=%llu costume=%llu scene_color=%llu viewport=%.0fx%.0f prepared=%llu rebound=%llu",
+                    activity.presented, activity.indexed, activity.stateReady, activity.costume, activity.sceneColor,
+                    activity.viewport.Width, activity.viewport.Height, activity.prepared, activity.rebound);
+                activity = {};
+            }
+        }
         Sleep(8);
     }
 }
@@ -2078,7 +2198,7 @@ bool StartAfterimage(const wchar_t* root, GameCompatibility::Kind kind, Controll
     logFile = _wfsopen((directory + L"\\NGS1Afterimage.log").c_str(), L"wb", _SH_DENYNO);
     gameBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     controllerHooks = shared;
-    Log("GAME pid=%lu build=%s afterimage=0.6.11", GetCurrentProcessId(), GameCompatibility::Name(kind));
+    Log("GAME pid=%lu build=%s afterimage=0.6.19 shader_bytecode=embedded", GetCurrentProcessId(), GameCompatibility::Name(kind));
     if (GetModuleHandleW(L"NGS1Afterimage.dll")) {
         Log("LEGACY_AFTERIMAGE_ALREADY_LOADED");
         return false;

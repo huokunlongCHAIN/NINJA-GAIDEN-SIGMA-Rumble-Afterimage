@@ -69,8 +69,7 @@ public static class LaunchEngine {
   NoLink(Launcher(root));NoLink(AutoLifecycle.Executable(root));return state;
  }
  static void Save(string root,LaunchState state){
-  string path=Marker(root),temp=Path.Combine(Runtime(root),".launch-"+Guid.NewGuid().ToString("N")+".tmp");
-  File.WriteAllText(temp,json.Serialize(state),new UTF8Encoding(false));try{if(File.Exists(path))File.Replace(temp,path,null);else File.Move(temp,path);}finally{if(File.Exists(temp))File.Delete(temp);}
+  PatchEngine.AtomicWrite(Marker(root),new UTF8Encoding(false).GetBytes(json.Serialize(state)));
  }
  public static bool HasState(string root){return Read(root)!=null;}
  public static void StartInstalledWatcher(string root){var state=Read(root);if(state!=null&&state.Phase=="Installed"&&state.AutoLoaderHash!=null)AutoLifecycle.Start(root,state.AutoLoaderHash);}

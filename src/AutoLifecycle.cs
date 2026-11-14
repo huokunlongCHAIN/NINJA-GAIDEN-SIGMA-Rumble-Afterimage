@@ -44,8 +44,7 @@ public static class AutoLifecycle {
  public static void WritePayload(string root,LaunchState state){
   string target=Executable(root);
   if(File.Exists(target)){string hash=RuntimeBridge.Hash(target);if(hash!=state.AutoLoaderHash&&hash!=state.PreviousAutoLoaderHash&&hash!=PayloadHashes.Values[FileName])throw new Exception(InstallerLanguage.T("自动加载器已被其它文件替换，未覆盖。", "The autoloader was replaced by another file. It was left intact."));}
-  var file=Payload.LoadExtra(FileName);string temp=Path.Combine(Path.GetDirectoryName(target),".auto-"+Guid.NewGuid().ToString("N")+".tmp");File.WriteAllBytes(temp,file.Bytes);
-  try{if(File.Exists(target))File.Replace(temp,target,null);else File.Move(temp,target);}finally{if(File.Exists(temp))File.Delete(temp);}
+  PatchEngine.AtomicWrite(target,Payload.LoadExtra(FileName).Bytes);
  }
 }
 }

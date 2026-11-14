@@ -26,6 +26,10 @@ static class Program {
   var json=new JavaScriptSerializer();
   try{
    if(operation=="--export-diagnostics"&&args.Length==3){PatchDiagnostics.Export(root,args[2]);return 0;}
+   if(operation=="--trace-game"&&args.Length==3){
+    string message=PatchDiagnostics.Run(operation,root,()=>PatchDiagnostics.Trace(root));
+    File.WriteAllText(args[2],json.Serialize(new{ok=true,message=message}),new UTF8Encoding(false));return 0;
+   }
    PatchDiagnostics.Log(operation,"BEGIN",root,"");
    if(operation=="--launch"&&args.Length==2){
     int pid=new FeatureFacade().Launch(root);
@@ -89,7 +93,7 @@ sealed class FeatureForm:Form {
   transparency=new NumericUpDown(),muscleHighlight=new NumericUpDown();
  readonly TableLayoutPanel visuals;
  readonly Control muscleRow,surfaceBrightnessRow;
- RoundedButton browse,installRumble,restoreRumble,installDS,restoreDS,installAfterimage,restoreAfterimage,pickColor,savePreset,launch,restoreAll,exportDiagnostics;
+ RoundedButton browse,installRumble,restoreRumble,installDS,restoreDS,installAfterimage,restoreAfterimage,pickColor,savePreset,launch,restoreAll,exportDiagnostics,traceGame;
  Color tint;
  bool translating;
  public FeatureForm(string initial=null){
@@ -180,15 +184,21 @@ sealed class FeatureForm:Form {
   visuals.Controls.Add(Field("","",savePreset),0,8);
   details.Dock=DockStyle.Fill;details.Multiline=true;details.ReadOnly=true;details.ScrollBars=ScrollBars.Vertical;details.BackColor=Color.FromArgb(30,38,50);details.ForeColor=Color.Gainsboro;details.BorderStyle=BorderStyle.None;page.Controls.Add(details,0,4);
   var actions=new FlowLayoutPanel{Dock=DockStyle.Fill,Margin=new Padding(0,8,0,0)};
-  launch=Button("启动游戏","Launch Game");launch.Width=220;
+  launch=Button("启动游戏","Launch Game");launch.Width=164;
   launch.Click+=async(s,e)=>await Run("launch-game",root=>String.Format(InstallerLanguage.T(
    "游戏已启动，进程 {0}","Game launched. Process ID {0}."),engine.Launch(root)));
-  restoreAll=Button("全部还原","Restore All");restoreAll.Width=180;
+  restoreAll=Button("全部还原","Restore All");restoreAll.Width=144;
   restoreAll.Click+=async(s,e)=>await Run("restore-all",engine.RestoreAll);
-  exportDiagnostics=Button("导出诊断包","Export Diagnostics");exportDiagnostics.Width=202;
+  exportDiagnostics=Button("导出诊断包","Export Diagnostics");exportDiagnostics.Width=176;
   exportDiagnostics.Glyph=ButtonGlyph.Export;
   exportDiagnostics.Click+=async(s,e)=>await ExportDiagnostics();
-  actions.Controls.Add(launch);actions.Controls.Add(restoreAll);actions.Controls.Add(exportDiagnostics);
+  traceGame=Button("追踪游戏闪退","Trace Game Crash");traceGame.Width=180;traceGame.Glyph=ButtonGlyph.Play;
+  traceGame.Click+=async(s,e)=>{
+   details.Text=InstallerLanguage.T("正在追踪本次游戏。请复现闪退，或正常退出以结束追踪。",
+    "Tracing this game session. Reproduce the crash, or exit the game to stop tracing.");
+   await Run("trace-game",PatchDiagnostics.Trace);
+  };
+  actions.Controls.Add(launch);actions.Controls.Add(traceGame);actions.Controls.Add(exportDiagnostics);actions.Controls.Add(restoreAll);
   page.Controls.Add(actions,0,5);
   ApplyLanguage();
   browse.Glyph=ButtonGlyph.Folder;
@@ -250,7 +260,7 @@ sealed class FeatureForm:Form {
   card.Controls.Add(install,1,0);card.Controls.Add(restore,2,0);
   return card;
  }
- void SetEnabled(bool value){foreach(var control in new Control[]{installRumble,restoreRumble,installDS,restoreDS,installAfterimage,restoreAfterimage,launch,restoreAll,outfit,material,brightness,surfaceBrightness,transparency,pickColor,muscleHighlight,savePreset})control.Enabled=value;}
+ void SetEnabled(bool value){foreach(var control in new Control[]{installRumble,restoreRumble,installDS,restoreDS,installAfterimage,restoreAfterimage,launch,traceGame,restoreAll,outfit,material,brightness,surfaceBrightness,transparency,pickColor,muscleHighlight,savePreset})control.Enabled=value;}
  void Browse(){using(var dialog=new OpenFileDialog{Title=InstallerLanguage.T("选择游戏 EXE","Select Game EXE"),Filter=InstallerLanguage.T("西格玛1","Ninja Gaiden Sigma")+"|NINJA GAIDEN SIGMA.exe",CheckFileExists=true})if(dialog.ShowDialog(this)==DialogResult.OK){path.Text=Path.GetDirectoryName(dialog.FileName);RefreshState(logInspection:true);}}
  void SetTint(Color color){tint=color;pickColor.FillColor=color;pickColor.ForeColor=color.GetBrightness()>0.55?Color.Black:Color.White;pickColor.Text=String.Format("#{0:X2}{1:X2}{2:X2}",color.R,color.G,color.B);pickColor.Invalidate();}
  AfterimageMaterial SelectedMaterial {get{return material.SelectedIndex==1?AfterimageMaterial.Sigma2:AfterimageMaterial.Classic;}}
@@ -293,6 +303,7 @@ sealed class FeatureForm:Form {
   outfit.Enabled=brightness.Enabled=transparency.Enabled=pickColor.Enabled=muscleHighlight.Enabled=savePreset.Enabled=info.Afterimage&&info.CanInstallAfterimage;
   material.Enabled=surfaceBrightness.Enabled=outfit.Enabled&&info.AfterimageMaterials;
   restoreAll.Enabled=info.CanRestore;launch.Enabled=hasPath&&(info.CanInstall||File.Exists(Path.Combine(path.Text,Payload.ExeName)));
+  traceGame.Enabled=launch.Enabled;
  }
  static string InstalledSuffix(bool active){return " · "+(active?InstallerLanguage.T("已安装","Installed"):InstallerLanguage.T("未安装","Not installed"));}
  async Task Run(string operation,Func<string,string> action){
