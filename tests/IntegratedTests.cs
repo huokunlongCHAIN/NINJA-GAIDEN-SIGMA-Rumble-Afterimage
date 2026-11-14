@@ -55,21 +55,26 @@ static class IntegratedTests {
    Check(FeatureIni.Get(File.ReadAllText(Path.Combine(installed.ConfigRoot,"NGS1Rumble.ini")),
     "Features","AutoIcons","0")=="1","The public installer did not enable built-in DualSense icons.");
    Check(Payload.FileHash(rules)==ruleHash,"Afterimage upgrade changed rumble rules.");
-   Check(features.LoadMaterial(root)==AfterimageMaterial.Classic&&features.LoadPreset(root,0).Opacity==29,
-    "Upgrade changed the active material or classic settings.");
+   Check(installed.HasNG2Material&&features.LoadMaterial(root)==AfterimageMaterial.Classic&&
+    features.LoadPreset(root,0).Opacity==29,"Upgrade changed the selected material or classic settings.");
    Check(installed.HasRenderProfiles&&installed.RenderProfile==AfterimageRenderProfile.Auto,
     "Upgrade did not default to automatic rendering profile selection.");
    Console.WriteLine("PASS: in-place upgrade preserves controller flags, rumble rules and classic afterimages.");
 
    for(int i=0;i<5;++i){
     Check(features.LoadPreset(root,i,AfterimageMaterial.Sigma2).Opacity==40,"Sigma2 default preset differs.");
+    var ng2=features.LoadPreset(root,i,AfterimageMaterial.NG2);
+    Check(ng2.Opacity==56&&ng2.Brightness==135&&ng2.Red==153&&ng2.Green==173&&ng2.Blue==253,
+     "NG2 default preset differs.");
     features.SavePreset(root,i,new AfterimagePreset{Brightness=200-i*20,Opacity=100-i*17,
      MuscleHighlight=20+i*15,Red=245-i,Green=30+i,Blue=15+i});
     features.SavePreset(root,i,new AfterimagePreset{Brightness=120+i*20,Opacity=35+i*7,
      SurfaceBrightness=120+i*20,MuscleHighlight=44-i*5,Red=132+i,Green=150+i,Blue=210+i},AfterimageMaterial.Sigma2);
+    ng2.Opacity=51+i;ng2.SurfaceBrightness=127+i;
+    features.SavePreset(root,i,ng2,AfterimageMaterial.NG2);
    }
    features.InstallAfterimage(root);
-   Check(features.LoadMaterial(root)==AfterimageMaterial.Sigma2,"The selected material was lost during upgrade.");
+   Check(features.LoadMaterial(root)==AfterimageMaterial.NG2,"The selected material was lost during upgrade.");
    for(int i=0;i<5;++i){
     var preset=features.LoadPreset(root,i);
     Check(preset.Brightness==200-i*20&&preset.Opacity==100-i*17&&preset.Red==245-i&&preset.Green==30+i&&preset.Blue==15+i,
@@ -80,11 +85,13 @@ static class IntegratedTests {
     Check(sigma2.Brightness==120+i*20&&sigma2.SurfaceBrightness==120+i*20&&sigma2.Opacity==35+i*7&&
      sigma2.Red==132+i&&sigma2.Green==150+i&&sigma2.Blue==210+i&&sigma2.MuscleHighlight==(exposed?44-i*5:0),
      "Sigma2 settings were not kept separately for each costume.");
+    var ng2=features.LoadPreset(root,i,AfterimageMaterial.NG2);
+    Check(ng2.Opacity==51+i&&ng2.SurfaceBrightness==127+i,"NG2 outfit settings were lost.");
    }
    features.SavePreset(root,0,features.LoadPreset(root,0));
    Check(features.LoadMaterial(root)==AfterimageMaterial.Classic&&
     features.LoadPreset(root,0,AfterimageMaterial.Sigma2).SurfaceBrightness==120,"Changing material overwrote the Sigma2 preset.");
-   Console.WriteLine("PASS: both materials keep independent presets for all five costumes.");
+   Console.WriteLine("PASS: all three materials keep independent presets for all five costumes.");
    features.SaveRenderProfile(root,AfterimageRenderProfile.Integrated);
    features.InstallRumble(root);
    Check(features.Inspect(root).RenderProfile==AfterimageRenderProfile.Integrated&&

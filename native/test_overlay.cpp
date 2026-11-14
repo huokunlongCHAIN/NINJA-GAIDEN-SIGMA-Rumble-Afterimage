@@ -82,7 +82,7 @@ void CheckClearForwarding() {
 int main() {
     logFile = stdout;
     settings.renderProfile = RenderProfile::Standard;
-    settings.glassVisual = false;
+    settings.material = AfterimageMaterial::Classic;
     constexpr UINT Size = 128;
     const HWND window = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, Size, Size, nullptr, nullptr, nullptr, nullptr);
     assert(window);
@@ -104,7 +104,7 @@ int main() {
     assert(SUCCEEDED(swap->GetBuffer(0, IID_PPV_ARGS(surface.GetAddressOf()))));
     ComPtr<ID3D11RenderTargetView> propTarget;
     assert(SUCCEEDED(device->CreateRenderTargetView(surface.Get(), nullptr, propTarget.GetAddressOf())));
-    const FLOAT propColor[]{0, 1, 0, 0.33f};
+    FLOAT propColor[]{0, 1, 0, 0.33f};
     // Attach after the first rendered frame, as the launcher does for a running game.
     immediate->ClearRenderTargetView(propTarget.Get(), propColor);
     swap->Present(0, 0);
@@ -262,7 +262,7 @@ int main() {
         packet.pose.renderFrame = renderFrame;
         const auto opacity = anchorOpacity > 0 ? anchorOpacity : 0.48f * (fadeStep + 1) / FadeSteps;
         packet.material = material;
-        packet.shader = settings.glassVisual ? curvedShader :
+        packet.shader = GlassVisual() ? curvedShader :
             (material == GhostMaterial::GripAtlas ? gripVertex : defaultVertex);
         auto first = packet, second = packet;
         if (seam) {
@@ -300,7 +300,7 @@ int main() {
         std::copy_n(pixels + 114 * mapped.RowPitch + 64 * 4, 4, samples[5].begin());
         std::copy_n(pixels + 64 * mapped.RowPitch + 55 * 4, 4, samples[6].begin());
         std::copy_n(pixels + 64 * mapped.RowPitch + 63 * 4, 4, samples[7].begin());
-        if (distortion && !playerFront && !settings.glassVisual) {
+        if (distortion && !playerFront && !GlassVisual()) {
             // Black tint makes any red outside the stripe attributable to displaced scene sampling.
             bool displaced = false;
             for (unsigned y = 55; y < 88; ++y) {
@@ -309,7 +309,7 @@ int main() {
             }
             assert(displaced && res.refraction.scene && !res.refraction.unavailable);
         }
-        if (seam) {
+        if (seam && !NG2Visual()) {
             const auto* row = pixels + 64 * mapped.RowPitch;
             const auto inner = row[56 * 4];
             const auto joint = row[63 * 4];
@@ -317,14 +317,14 @@ int main() {
                 row[64 * 4] == joint);
             printf("Anatomical opacity: part interior red %u, joint red %u.\n", inner, joint);
         }
-        if (playerFront && distortion && !settings.glassVisual) {
+        if (playerFront && distortion && !GlassVisual()) {
             // The refracted sample cannot pull pixels from the live silhouette.
             for (unsigned y = 55; y < 88; ++y) {
                 const auto* row = pixels + y * mapped.RowPitch;
                 assert(row[63 * 4] == 0 && row[64 * 4] == 255);
             }
             puts("Refraction did not sample the front character into the background.");
-        } else if (playerFront && !settings.glassVisual && res.refraction.maskWidth == Size && strength == 0) {
+        } else if (playerFront && settings.material == AfterimageMaterial::Classic && res.refraction.maskWidth == Size && strength == 0) {
             const auto* row = pixels + 64 * mapped.RowPitch;
             const std::array<BYTE, 4> liveColor{0, 255, 0, 84};
             assert(std::equal(liveColor.begin(), liveColor.end(), row + 64 * 4));
@@ -558,16 +558,20 @@ int main() {
             std::to_wstring(60 + i).c_str(), tempIni));
     }
     ReadSettings();
-    assert(settings.glassVisual && settings.alpha == 64 && settings.brightness == 200);
+    assert(GlassVisual() && settings.alpha == 64 && settings.brightness == 200);
     for (unsigned i = 0; i < std::size(Costumes); ++i) {
         activeCostume = static_cast<Costume>(i);
         ApplyAppearance();
         assert(settings.brightness == 196 + i && settings.glowStrength == 196 + i && settings.alpha == 60 + i);
     }
+    assert(WritePrivateProfileStringW(L"Afterimage", L"Material", L"NG2", tempIni));
+    assert(WritePrivateProfileStringW(L"Afterimage.NG2.Grip", L"SurfaceBrightnessPercent", L"174", tempIni));
+    ReadSettings();
+    assert(NG2Visual() && settings.brightness == 174 && settings.alpha == 56 && settings.glowStrength == 135);
     assert(WritePrivateProfileStringW(L"Afterimage", L"Material", L"Classic", tempIni));
     assert(WritePrivateProfileStringW(L"Afterimage.Grip", L"GlowStrengthPercent", L"200", tempIni));
     ReadSettings();
-    assert(!settings.glassVisual && activeCostume == Costume::Grip && settings.alpha == 77 &&
+    assert(settings.material == AfterimageMaterial::Classic && activeCostume == Costume::Grip && settings.alpha == 77 &&
         settings.glowStrength == 200);
     assert(DeleteFileW(tempIni));
     puts("Runtime reload switches material and applies the corresponding preset for each outfit.");
@@ -600,7 +604,7 @@ int main() {
         code.ReleaseAndGetAddressOf(), nullptr)));
     assert(SUCCEEDED(device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr,
         curvedShader.GetAddressOf())));
-    settings.glassVisual = true;
+    settings.material = AfterimageMaterial::Sigma2;
     settings.glassRefraction = 0;
     const auto transparent = draw(0, 0, FadeSteps - 1, 1);
     settings.glassRefraction = 36;
@@ -628,7 +632,7 @@ int main() {
     const auto disabledGlass = draw(0, 0, FadeSteps - 1, 0);
     assert(disabledGlass[1] == prop && disabledGlass[2] == prop && disabledGlass[3] == prop);
     assert(res.refraction.maskFormat == DXGI_FORMAT_R8G8B8A8_UNORM);
-    settings.glassVisual = false;
+    settings.material = AfterimageMaterial::Classic;
     draw(0);
     assert(res.refraction.maskFormat == DXGI_FORMAT_R8G8_UNORM);
     auto depthDesc = MaskDescription();
@@ -646,7 +650,7 @@ int main() {
     ComPtr<ID3D11Texture2D> splitScene;
     assert(SUCCEEDED(device->CreateTexture2D(&depthDesc, &initialDepth, splitScene.GetAddressOf())));
     for (bool sigma2 : {false, true}) {
-        settings.glassVisual = sigma2;
+        settings.material = sigma2 ? AfterimageMaterial::Sigma2 : AfterimageMaterial::Classic;
         auto visibleEdge = draw(100);
         assert(visibleEdge[6] == prop && visibleEdge[0] != prop);
         immediate->ClearDepthStencilView(obstacle.Get(), D3D11_CLEAR_DEPTH, 0.8f, 0);
@@ -669,7 +673,7 @@ int main() {
     assert(res.coverageDesc.Width == Size / 2 && res.refraction.surface.Width == Size);
     assert(withoutDepthCopy[6] != prop && withoutDepthCopy[0] != prop);
     for (bool sigma2 : {false, true}) {
-        settings.glassVisual = sigma2;
+        settings.material = sigma2 ? AfterimageMaterial::Sigma2 : AfterimageMaterial::Classic;
         draw(100);
         auto* mask = res.refraction.maskView.Get();
         assert(res.refraction.slices.size() >= settings.copies + 1);
@@ -699,6 +703,46 @@ int main() {
     puts("Both materials composite half-resolution masks at full resolution, preserve player occlusion, and reuse mask layers.");
     puts("Both materials hide the part of a pose behind scene depth, including depth cleared before Present.");
     puts("Glass style preserves background detail, bends it along the surface, and protects the live silhouette.");
+    settings.material = AfterimageMaterial::NG2;
+    settings.tint = {153, 173, 253};
+    settings.brightness = 100;
+    settings.sceneDepthMode = 1;
+    assert(PrepareGhost(device.Get(), res));
+    const auto ng2Base = draw(0, 0.56f);
+    const auto ng2Light = draw(135, 0.56f);
+    const auto ng2Faded = draw(135, 0.12f);
+    const auto ng2Front = draw(135, 0.56f, FadeSteps - 1, 0, false, true);
+    assert(ng2Light[0][2] > ng2Base[0][2] && ng2Light[0][2] > ng2Light[0][0]);
+    assert(ng2Faded[0][2] < ng2Light[0][2] && ng2Light[0][1] > 100);
+    assert(ng2Light[3] == prop && ng2Front[0] == prop && ng2Front[6] != prop);
+    assert(res.refraction.maskFormat == DXGI_FORMAT_R8G8B8A8_UNORM && !res.refraction.unavailable);
+    // On a bright background, even dim regions of a silhouette must not leave
+    // a dark track. The scan crosses both anatomical labels at their seam.
+    const std::array<BYTE, 4> warmProp{196, 146, 98, 84};
+    const FLOAT warmBackground[]{warmProp[0] / 255.0f, warmProp[1] / 255.0f, warmProp[2] / 255.0f, warmProp[3] / 255.0f};
+    std::copy(std::begin(warmBackground), std::end(warmBackground), propColor);
+    for (const auto profile : {RenderProfile::Standard, RenderProfile::Integrated}) {
+        settings.renderProfile = profile;
+        draw(135, 0.56f, FadeSteps - 1, 0, true);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        assert(SUCCEEDED(immediate->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped)));
+        const auto* pixels = static_cast<const BYTE*>(mapped.pData);
+        unsigned minBlue = 255, maxBlue = 0;
+        for (unsigned y = 52; y <= 96; ++y) {
+            for (unsigned x = 58; x <= 69; ++x) {
+                const auto* pixel = pixels + y * mapped.RowPitch + 4 * x;
+                assert(pixel[0] >= warmProp[0] && pixel[1] >= warmProp[1] && pixel[2] >= warmProp[2]);
+                minBlue = std::min(minBlue, unsigned(pixel[2]));
+                maxBlue = std::max(maxBlue, unsigned(pixel[2]));
+            }
+        }
+        immediate->Unmap(readback.Get(), 0);
+        assert(minBlue > warmProp[2] + 5 && maxBlue > minBlue + 10);
+        assert(res.refraction.maskWidth == (profile == RenderProfile::Standard ? Size : Size / 2));
+        printf("NG2 %s masks keep the lit background and vary blue from %u to %u.\n",
+            profile == RenderProfile::Standard ? "full" : "half", minBlue, maxBlue);
+    }
+    puts("NG2 material emits cold light, transmits background, fades, and respects the live silhouette.");
     hooksReady = false;
     assert(deviceEntries[0].Restore());
     assert(presentEntries[0].Restore());

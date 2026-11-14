@@ -255,7 +255,7 @@ sealed class FeatureForm:Form {
   outfit.SelectedIndex=selection;
   material.Items.Clear();
   material.Items.AddRange(new object[]{AfterimagePreset.MaterialLabel(AfterimageMaterial.Classic),
-   AfterimagePreset.MaterialLabel(AfterimageMaterial.Sigma2)});
+   AfterimagePreset.MaterialLabel(AfterimageMaterial.Sigma2),AfterimagePreset.MaterialLabel(AfterimageMaterial.NG2)});
   material.SelectedIndex=selectedMaterial;
   renderProfile.Items.Clear();
   renderProfile.Items.AddRange(new object[]{
@@ -308,12 +308,12 @@ sealed class FeatureForm:Form {
  void SetEnabled(bool value){foreach(var control in new Control[]{installRumble,restoreRumble,installDS,restoreDS,installAfterimage,restoreAfterimage,launch,traceGame,restoreAll,outfit,material,brightness,surfaceBrightness,transparency,pickColor,muscleHighlight,savePreset,renderProfile,saveProfile})control.Enabled=value;}
  void Browse(){using(var dialog=new OpenFileDialog{Title=InstallerLanguage.T("选择游戏 EXE","Select Game EXE"),Filter=InstallerLanguage.T("西格玛1","Ninja Gaiden Sigma")+"|NINJA GAIDEN SIGMA.exe",CheckFileExists=true})if(dialog.ShowDialog(this)==DialogResult.OK){path.Text=Path.GetDirectoryName(dialog.FileName);RefreshState(logInspection:true);}}
  void SetTint(Color color){tint=color;pickColor.FillColor=color;pickColor.ForeColor=color.GetBrightness()>0.55?Color.Black:Color.White;pickColor.Text=String.Format("#{0:X2}{1:X2}{2:X2}",color.R,color.G,color.B);pickColor.Invalidate();}
- AfterimageMaterial SelectedMaterial {get{return material.SelectedIndex==1?AfterimageMaterial.Sigma2:AfterimageMaterial.Classic;}}
+ AfterimageMaterial SelectedMaterial {get{return (AfterimageMaterial)Math.Max(0,material.SelectedIndex);}}
  AfterimageRenderProfile SelectedProfile {get{return (AfterimageRenderProfile)Math.Max(0,renderProfile.SelectedIndex);}}
  void RefreshPreset(){
   if(outfit.SelectedIndex<0)return;
   bool showMuscle=AfterimagePreset.ShowsMuscleHighlight(outfit.SelectedIndex);
-  bool showSurfaceBrightness=SelectedMaterial==AfterimageMaterial.Sigma2;
+  bool showSurfaceBrightness=SelectedMaterial!=AfterimageMaterial.Classic;
   surfaceBrightnessRow.Visible=showSurfaceBrightness;
   visuals.RowStyles[5].Height=showSurfaceBrightness?38:0;
   muscleRow.Visible=showMuscle;
@@ -343,7 +343,7 @@ sealed class FeatureForm:Form {
   rumbleState.Text=InstallerLanguage.T("震动补丁","Rumble")+InstalledSuffix(info.Rumble);
   dsState.Text=InstallerLanguage.T("PS5 手柄＋自动图标","DualSense + Icons")+InstalledSuffix(info.DualSense);
   afterimageState.Text=InstallerLanguage.T("服装残影","Costume Afterimages")+InstalledSuffix(info.Afterimage);
-  if(info.Afterimage&&!info.HasRenderProfiles)
+  if(info.Afterimage&&!info.HasNG2Material)
    afterimageState.Text+=InstallerLanguage.T(" · 可更新"," · Update available");
   installRumble.Enabled=installDS.Enabled=info.CanInstall;restoreRumble.Enabled=info.Rumble;restoreDS.Enabled=info.DualSense;
   installAfterimage.Enabled=info.CanInstallAfterimage;restoreAfterimage.Enabled=info.Afterimage;

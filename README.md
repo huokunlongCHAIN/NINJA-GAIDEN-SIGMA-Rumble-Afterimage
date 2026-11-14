@@ -10,7 +10,7 @@
 
 右上角可即时切换简体中文和 English，安装器会记住上次选择。安装包附有中英文使用说明。
 
-「残影」页提供「原版材质」和带有透景折射的「sigma2 材质」。两种材质在五套服装上各自保存发光强度、颜色和透明度。两种材质的发光强度以及 sigma2 的材质亮度均可调至 200%，各自的渲染贡献是 100% 的两倍。先安装／更新残影运行库，再点击「保存并应用材质」热重载设置。默认黑衣、蓝色传说忍者服和杀戮凶手提供肌肉高亮调节，默认 45%。场景深度可用时，墙面会挡住后方残影。核显专项模式与 Intel 显卡默认跳过场景深度复制，可能影响墙面遮挡。
+「残影」页提供「仿原版材质」「仿sigma2材质」和「仿无印2材质」。三种材质在五套服装上各自保存发光强度、颜色和透明度。三种材质的发光强度，以及仿sigma2和仿无印2的材质亮度，均可调至 200%。先安装／更新残影运行库，再点击「保存并应用材质」热重载设置。默认黑衣、蓝色传说忍者服和杀戮凶手提供肌肉高亮调节，默认 45%。场景深度可用时，墙面会挡住后方残影。核显专项模式与 Intel 显卡默认跳过场景深度复制，可能影响墙面遮挡。
 
 「渲染模式」默认按游戏实际使用的显卡选择。独显使用完整轨迹和全分辨率遮罩，核显使用两层轨迹和半分辨率遮罩。安装器显示本机 CPU 和显卡，并可手动选择「常规优化」或「核显专项优化」。点击「应用模式」后，运行中的游戏会自动读取设置。
 
@@ -50,7 +50,7 @@ Download the ZIP from Releases, exit the game, and run `NGS1RumblePatch.exe`. Ch
 
 The public package supports verified 1.0.0.2 and 1.0.0.4 builds, including the tested 1.0.0.4 Chinese localization. Installing DualSense support also enables automatic PlayStation/Xbox button icons. The source build commands above use PowerShell 7 and x64 LLVM with MinGW.
 
-The Afterimages tab offers Classic and refractive sigma2 materials, with separate glow strength, color and transparency settings for all five costumes. Both materials support 200% glow strength, and sigma2 also supports 200% surface brightness. These settings double the corresponding contribution at 100%. Walls occlude afterimages where scene depth is available. Integrated Graphics mode and Intel adapters skip scene depth copies by default, which can affect wall occlusion. After updating the runtime, **Save and Apply Material** reloads the appearance in a running game.
+The Afterimages tab offers Classic-style, Sigma 2-style, and Ninja Gaiden 2-style materials, with separate glow strength, color, and transparency settings for all five costumes. All three support 200% glow strength. The Sigma 2- and Ninja Gaiden 2-style materials also support 200% surface brightness. Walls occlude afterimages where scene depth is available. Integrated Graphics mode and Intel adapters skip scene depth copies by default, which can affect wall occlusion. After updating the runtime, **Save and Apply Material** reloads the appearance in a running game.
 
 The installer lists the CPU and graphics adapters. By default, Auto selects a render profile based on the adapter used by the game. Discrete GPUs draw the full trail with full-resolution masks. Integrated GPUs draw up to two poses with half-resolution masks. Choose **Standard** or **Integrated Graphics** and click **Apply Profile** to override the setting during play.
 

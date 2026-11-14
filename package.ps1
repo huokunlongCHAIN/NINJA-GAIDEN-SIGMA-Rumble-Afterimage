@@ -10,6 +10,9 @@ $info=[ordered]@{product='NGS1RumblePatch';version=$version;core='0.7.5';install
 $info.sigma2MaxGlowStrength=200
 $info.classicMaxGlowStrength=200
 $info.afterimageRenderProfiles=@('Auto','Standard','Integrated')
+$info.afterimageMaterials+=@('NG2')
+$info.ng2MaxSurfaceBrightness=200
+$info.ng2MaxGlowStrength=200
 foreach($name in @('dinput8.dll','NGS1Rumble.ini','NGS1RumbleRules.ini','NGS1RumbleWaves.ini','NGS1RumbleAuto.exe')){
  $info.embeddedFiles[$name]=(Get-FileHash -LiteralPath (Join-Path $base ('payload\'+$name))).Hash
 }

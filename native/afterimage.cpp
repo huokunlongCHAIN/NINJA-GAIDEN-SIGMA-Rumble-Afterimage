@@ -177,6 +177,7 @@ struct ContextState {
 struct RefractionResources {
     ComPtr<ID3D11VertexShader> fullscreen;
     ComPtr<ID3D11PixelShader> composite, partShader, gloveShader, gripShader, playerCoverage;
+    ComPtr<ID3D11PixelShader> ng2Composite, ng2Part, ng2Glove, ng2Grip;
     ComPtr<ID3D11SamplerState> linearSampler;
     ComPtr<ID3D11BlendState> rgbBlend;
     ComPtr<ID3D11Texture2D> scene;
@@ -258,6 +259,7 @@ struct DeviceResources {
 
 enum class Action { None, ET, UT, WindRun, WallDownslash, FlyingSwallow, WhiteFeather };
 enum class RenderProfile { Auto, Standard, Integrated };
+enum class AfterimageMaterial { Classic, Sigma2, NG2 };
 
 struct Appearance {
     unsigned alpha = 40;
@@ -288,7 +290,7 @@ struct Settings {
     unsigned muscleHighlight = 45;
     unsigned refractionPixels = 1;
     unsigned jointOpacity = 76;
-    bool glassVisual = false;
+    AfterimageMaterial material = AfterimageMaterial::Classic;
     unsigned glassRefraction = 19;
     unsigned brightness = 100;
     std::array<unsigned, 3> tint{144, 163, 253};
@@ -391,6 +393,12 @@ bool LimitGhostLayers() {
     if (settings.renderProfile != RenderProfile::Auto)
         return settings.renderProfile == RenderProfile::Integrated;
     return graphicsAdapter == GraphicsAdapter::Integrated || graphicsAdapter == GraphicsAdapter::Software;
+}
+
+bool GlassVisual() { return settings.material == AfterimageMaterial::Sigma2; }
+bool NG2Visual() { return settings.material == AfterimageMaterial::NG2; }
+const char* MaterialName() {
+    return NG2Visual() ? "NG2" : GlassVisual() ? "Sigma2" : "Classic";
 }
 
 const char* ProfileName(RenderProfile profile) {
@@ -1383,7 +1391,7 @@ bool InspectDraw(Context* c, const Draw& draw) {
         const bool gripAtlas = surface == GhostMaterial::GripAtlas;
         const float skinBoost = 0.46f * settings.muscleHighlight / 100.0f;
         const float glow = settings.glowStrength / 100.0f;
-        const float lighting = settings.glassVisual ? (settings.brightness / 100.0f + glow) * 0.48f : 1.0f + glow;
+        const float lighting = GlassVisual() ? (settings.brightness / 100.0f + glow) * 0.48f : 1.0f + glow;
         const float intensity = settings.alpha * lighting * (1 - body) / 25500.0f;
         auto setPS = Original<SetPS>(c, PsShader);
         auto drawUnderlay = [&](ID3D11PixelShader* shader, float level) {
@@ -1543,9 +1551,21 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
         res = std::move(prepared);
         Log("REFRACTION_PIPELINE_READY");
     }
+    if (NG2Visual() && !res.ng2Composite) {
+        ComPtr<ID3D11PixelShader> composite, part, glove, grip;
+        if (!CreatePixelShader(device, AfterimageShaders::NG2Composite, composite) ||
+            !CreatePixelShader(device, AfterimageShaders::NG2Part, part) ||
+            !CreatePixelShader(device, AfterimageShaders::NG2Glove, glove) ||
+            !CreatePixelShader(device, AfterimageShaders::NG2Grip, grip)) return false;
+        res.ng2Composite = std::move(composite);
+        res.ng2Part = std::move(part);
+        res.ng2Glove = std::move(glove);
+        res.ng2Grip = std::move(grip);
+    }
     const bool sameSize = res.scene && res.surface.Width == backBuffer.Width &&
         res.surface.Height == backBuffer.Height && res.surface.Format == backBuffer.Format;
-    const DXGI_FORMAT maskFormat = settings.glassVisual ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8G8_UNORM;
+    const DXGI_FORMAT maskFormat = settings.material == AfterimageMaterial::Classic ?
+        DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
     const bool sameMask = res.maskWidth == maskWidth && res.maskHeight == maskHeight && res.maskFormat == maskFormat;
     if (sameSize && sameMask && res.slices.size() >= layers) return true;
     auto desc = backBuffer;
@@ -1599,7 +1619,7 @@ void CompositeRefraction(Context* c, DeviceResources& res, ID3D11RenderTargetVie
     Original<SetLayout>(c, InputLayout)(c, nullptr);
     Original<SetTopology>(c, Topology)(c, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     Original<SetVS>(c, VsShader)(c, refraction.fullscreen.Get(), nullptr, 0);
-    Original<SetPS>(c, PsShader)(c, refraction.composite.Get(), nullptr, 0);
+    Original<SetPS>(c, PsShader)(c, NG2Visual() ? refraction.ng2Composite.Get() : refraction.composite.Get(), nullptr, 0);
     Original<SetBlend>(c, Blend)(c, refraction.rgbBlend.Get(), nullptr, UINT_MAX);
     auto* sampler = refraction.linearSampler.Get();
     c->PSSetSamplers(0, 1, &sampler);
@@ -1616,7 +1636,7 @@ void CompositeRefraction(Context* c, DeviceResources& res, ID3D11RenderTargetVie
     const Parameters constants{float(settings.refractionPixels), float(GetTickCount64() % 8000) * 0.0007853982f,
         settings.glowStrength / 100.0f, settings.jointOpacity / 100.0f, opacities, layers,
         playerFront ? layers : UINT_MAX, settings.muscleHighlight / 100.0f,
-        settings.glassVisual ? float(settings.glassRefraction) : -1.0f,
+        GlassVisual() ? float(settings.glassRefraction) : -1.0f,
         settings.brightness / 100.0f, {}};
     c->UpdateSubresource(refraction.parameters.Get(), 0, nullptr, &constants, 0, 0);
     ID3D11Buffer* buffers[]{refraction.parameters.Get(), res.colors.back().Get()};
@@ -1784,7 +1804,10 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
     if (!useRefraction) Original<SetTargets>(c, Targets)(c, 1, &rtv, stencil);
     Original<SetDepth>(c, Depth)(c, useRefraction ? refraction.partDepth.Get() : res.overlayStencil.Get(), 0);
     Original<SetViewport>(c, Viewports)(c, 1, &viewport);
-    Original<SetPS>(c, PsShader)(c, useRefraction ? refraction.partShader.Get() : res.ghostShader.Get(), nullptr, 0);
+    auto* defaultPart = NG2Visual() ? refraction.ng2Part.Get() : refraction.partShader.Get();
+    auto* gripPart = NG2Visual() ? refraction.ng2Grip.Get() : refraction.gripShader.Get();
+    auto* glovePart = NG2Visual() ? refraction.ng2Glove.Get() : refraction.gloveShader.Get();
+    Original<SetPS>(c, PsShader)(c, useRefraction ? defaultPart : res.ghostShader.Get(), nullptr, 0);
     Original<SetBlend>(c, Blend)(c, useRefraction ? nullptr : res.ghostBlend.Get(), nullptr, UINT_MAX);
     auto* lighting = res.ghostLighting.Get();
     Original<SetBuffers>(c, PsConstants)(c, ColorSlot - 1, 1, &lighting);
@@ -1796,7 +1819,8 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
     auto* depthTexture = hasSceneDepth ? sceneDepth.view.Get() : nullptr;
     c->PSSetShaderResources(2, 1, &depthTexture);
     if (useRefraction) {
-        const FLOAT projection[4]{1.0f / coverageSurface.Height};
+        const FLOAT projection[4]{1.0f / coverageSurface.Height,
+            0.5f * coverageSurface.Width / coverageSurface.Height};
         c->UpdateSubresource(lighting, 0, nullptr, projection, 0, 0);
     }
     c->RSSetState(res.overlayRasterizer.Get());
@@ -1805,7 +1829,7 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
     float lastOpacity = -1;
     ID3D11Buffer* lastColor = nullptr;
     unsigned lastPartLabel = UINT_MAX;
-    auto* partShader = refraction.partShader.Get();
+    auto* partShader = defaultPart;
     unsigned layerIndex = 0, ghostDraws = 0;
     OverlayBindings bindings;
     for (const auto& queued : poses) {
@@ -1824,7 +1848,7 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
         if (!useRefraction && queued.opacity != lastOpacity) {
             const float glow = settings.glowStrength / 100.0f;
             const FLOAT constants[4]{queued.opacity,
-                settings.glassVisual ? settings.brightness / 100.0f + glow : 1.0f + glow};
+                settings.material != AfterimageMaterial::Classic ? settings.brightness / 100.0f + glow : 1.0f + glow};
             c->UpdateSubresource(lighting, 0, nullptr, constants, 0, 0);
             lastOpacity = queued.opacity;
         }
@@ -1838,8 +1862,8 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
                 const bool mixed = packet.material == GhostMaterial::Glove || packet.material == GhostMaterial::GripAtlas;
                 const auto material = mixed ? GhostMaterial::Armor : packet.material;
                 const unsigned labelIndex = unsigned(material) * 8 + unsigned(packet.bodyPart) - 1;
-                auto* nextShader = packet.material == GhostMaterial::GripAtlas ? refraction.gripShader.Get() :
-                    packet.material == GhostMaterial::Glove ? refraction.gloveShader.Get() : refraction.partShader.Get();
+                auto* nextShader = packet.material == GhostMaterial::GripAtlas ? gripPart :
+                    packet.material == GhostMaterial::Glove ? glovePart : defaultPart;
                 if (nextShader != partShader) {
                     Original<SetPS>(c, PsShader)(c, nextShader, nullptr, 0);
                     partShader = nextShader;
@@ -1895,9 +1919,9 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
         Log("OVERLAY_DRAW frame=%llu draws=%u poses=%u backbuffer=%ux%u mask=%ux%u state_binds=%u brightness=%u emission=%u refraction=%u segmented=%u player_front=%u style=%s scene_depth=%ux%u frozen=%u",
             static_cast<unsigned long long>(renderFrame), ghostDraws, layerCount, desc.Width,
             desc.Height, coverageSurface.Width, coverageSurface.Height, bindings.changes, settings.brightness, settings.glowStrength,
-            useRefraction ? (settings.glassVisual ? settings.glassRefraction : settings.refractionPixels) : 0,
+            useRefraction && !NG2Visual() ? (GlassVisual() ? settings.glassRefraction : settings.refractionPixels) : 0,
             unsigned(useRefraction), frontDraws,
-            settings.glassVisual ? "Sigma2" : "Classic", hasSceneDepth ? sceneDepth.desc.Width : 0,
+            MaterialName(), hasSceneDepth ? sceneDepth.desc.Width : 0,
             hasSceneDepth ? sceneDepth.desc.Height : 0, hasSceneDepth && sceneDepth.frozen);
     return true;
 }
@@ -2247,7 +2271,8 @@ void ReadSettings() {
     std::array<Appearance, std::size(Costumes)> loaded;
     wchar_t material[24]{};
     GetPrivateProfileStringW(L"Afterimage", L"Material", L"Classic", material, std::size(material), ini.c_str());
-    updated.glassVisual = _wcsicmp(material, L"Sigma2") == 0;
+    if (_wcsicmp(material, L"Sigma2") == 0) updated.material = AfterimageMaterial::Sigma2;
+    else if (_wcsicmp(material, L"NG2") == 0) updated.material = AfterimageMaterial::NG2;
     updated.enabled = ReadNumber(L"Enabled", 1, 0, 1) != 0;
     updated.autoET = ReadNumber(L"AutomaticDragonET", 1, 0, 1) != 0;
     updated.autoUT = ReadNumber(L"AutomaticDragonUT", 1, 0, 1) != 0;
@@ -2281,14 +2306,16 @@ void ReadSettings() {
                 const auto value = static_cast<int>(GetPrivateProfileIntW(section, key, fallback, ini.c_str()));
                 return static_cast<unsigned>(std::clamp(value, 0, static_cast<int>(maximum)));
             };
-            return {read(L"OpacityPercent", 40, 100),
-                read(L"GlowStrengthPercent", 68, MaxGlowStrength),
-                {read(L"TintR", 144, 255), read(L"TintG", 163, 255), read(L"TintB", 253, 255)},
+            const bool ng2 = updated.material == AfterimageMaterial::NG2;
+            return {read(L"OpacityPercent", ng2 ? 56 : 40, 100),
+                read(L"GlowStrengthPercent", ng2 ? 135 : 68, MaxGlowStrength),
+                {read(L"TintR", ng2 ? 153 : 144, 255), read(L"TintG", ng2 ? 173 : 163, 255), read(L"TintB", 253, 255)},
                 exposedSkin ? read(L"MuscleHighlightPercent", 45, 100) : 0,
                 read(L"SurfaceBrightnessPercent", 100, MaxSurfaceBrightness)};
         };
-        if (updated.glassVisual) {
-            const auto section = std::wstring(L"Afterimage.Sigma2") + wcschr(Costumes[i].section, L'.');
+        if (updated.material != AfterimageMaterial::Classic) {
+            const auto prefix = updated.material == AfterimageMaterial::NG2 ? L"Afterimage.NG2" : L"Afterimage.Sigma2";
+            const auto section = std::wstring(prefix) + wcschr(Costumes[i].section, L'.');
             loaded[i] = load(section.c_str());
         } else {
             loaded[i] = load(Costumes[i].section);
@@ -2305,8 +2332,10 @@ void ReadSettings() {
     if (previousSettings.sceneDepthMode != settings.sceneDepthMode)
         Log("SCENE_DEPTH_MODE config=%u enabled=%u", settings.sceneDepthMode, unsigned(SceneDepthEnabled()));
     if (previousSettings.renderProfile != settings.renderProfile) LogRenderProfile();
-    if (previousSettings.glassVisual != settings.glassVisual)
-        Log("MATERIAL_RELOAD %s", settings.glassVisual ? "Sigma2" : "Classic");
+    if (previousSettings.material != settings.material) {
+        loggedOverlays = 0;
+        Log("MATERIAL_RELOAD %s", MaterialName());
+    }
     if (activeCostume != Costume::Unknown && (previous.alpha != settings.alpha ||
         previous.glow != settings.glowStrength || previous.tint != settings.tint ||
         previous.muscleHighlight != settings.muscleHighlight || previous.brightness != settings.brightness)) {
@@ -2419,13 +2448,13 @@ bool StartAfterimage(const wchar_t* root, GameCompatibility::Kind kind, Controll
     logFile = _wfsopen((directory + L"\\NGS1Afterimage.log").c_str(), L"wb", _SH_DENYNO);
     gameBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     controllerHooks = shared;
-    Log("GAME pid=%lu build=%s afterimage=0.6.22 shader_bytecode=embedded", GetCurrentProcessId(), GameCompatibility::Name(kind));
+    Log("GAME pid=%lu build=%s afterimage=0.6.25 shader_bytecode=embedded", GetCurrentProcessId(), GameCompatibility::Name(kind));
     if (GetModuleHandleW(L"NGS1Afterimage.dll")) {
         Log("LEGACY_AFTERIMAGE_ALREADY_LOADED");
         return false;
     }
     ReadSettings();
-    Log("VISUAL_STYLE %s", settings.glassVisual ? "Sigma2" : "Classic");
+    Log("VISUAL_STYLE %s", MaterialName());
     if (kind == GameCompatibility::Kind::Unsupported || !InstallHooks(kind)) {
         Log("INITIALIZATION_FAILED");
         return false;

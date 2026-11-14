@@ -11,9 +11,10 @@ public sealed class FeatureInspection {
  public string Root,Description,ConfigRoot;public bool CanInstall,CanInstallAfterimage,CanRestore,Rumble,DualSense,Afterimage,AfterimageMaterials;
  public int MaxSurfaceBrightness=100,MaxGlowStrength=100,MaxClassicGlowStrength=100;
  public bool HasRenderProfiles;
+ public bool HasNG2Material;
  public AfterimageRenderProfile RenderProfile;
 }
-public enum AfterimageMaterial { Classic, Sigma2 }
+public enum AfterimageMaterial { Classic, Sigma2, NG2 }
 public enum AfterimageRenderProfile { Auto, Standard, Integrated }
 public sealed class AfterimagePreset {
  public const int MaxSurfaceBrightness=200;
@@ -30,15 +31,21 @@ public sealed class AfterimagePreset {
  }
  public static bool ShowsMuscleHighlight(int costume){return costume==0||costume==2||costume==4;}
  public static string MaterialLabel(AfterimageMaterial material){
-  return material==AfterimageMaterial.Sigma2?InstallerLanguage.T("sigma2 材质","sigma2 Material"):InstallerLanguage.T("原版材质","Classic Material");
+  switch(material){
+   case AfterimageMaterial.Sigma2:return InstallerLanguage.T("仿sigma2材质","Sigma 2-style Material");
+   case AfterimageMaterial.NG2:return InstallerLanguage.T("仿无印2材质","Ninja Gaiden 2-style Material");
+   default:return InstallerLanguage.T("仿原版材质","Classic-style Material");
+  }
  }
  public static AfterimageMaterial ReadMaterial(string ini){
-  return String.Equals(FeatureIni.Get(ini,"Afterimage","Material",""),"Sigma2",StringComparison.OrdinalIgnoreCase)
+  string material=FeatureIni.Get(ini,"Afterimage","Material","");
+  if(String.Equals(material,"NG2",StringComparison.OrdinalIgnoreCase))return AfterimageMaterial.NG2;
+  return String.Equals(material,"Sigma2",StringComparison.OrdinalIgnoreCase)
    ?AfterimageMaterial.Sigma2:AfterimageMaterial.Classic;
  }
  static string Section(int costume,AfterimageMaterial material){
   string section=Sections[costume];
-  return material==AfterimageMaterial.Sigma2?section.Insert("Afterimage".Length,".Sigma2"):section;
+  return material==AfterimageMaterial.Classic?section:section.Insert("Afterimage".Length,"."+material);
  }
  static int Number(string ini,string section,string key,int fallback,int max){
   int value;
@@ -46,12 +53,13 @@ public sealed class AfterimagePreset {
  }
  public static AfterimagePreset Read(string ini,int costume,AfterimageMaterial material=AfterimageMaterial.Classic){
   string section=Section(costume,material);
+  bool ng2=material==AfterimageMaterial.NG2;
   return new AfterimagePreset{
-   Brightness=Number(ini,section,"GlowStrengthPercent",68,MaxGlowStrength),
+   Brightness=Number(ini,section,"GlowStrengthPercent",ng2?135:68,MaxGlowStrength),
    SurfaceBrightness=Number(ini,section,"SurfaceBrightnessPercent",100,MaxSurfaceBrightness),
-   Opacity=Number(ini,section,"OpacityPercent",40,100),
+   Opacity=Number(ini,section,"OpacityPercent",ng2?56:40,100),
    MuscleHighlight=ShowsMuscleHighlight(costume)?Number(ini,section,"MuscleHighlightPercent",45,100):0,
-   Red=Number(ini,section,"TintR",144,255),Green=Number(ini,section,"TintG",163,255),Blue=Number(ini,section,"TintB",253,255)
+   Red=Number(ini,section,"TintR",ng2?153:144,255),Green=Number(ini,section,"TintG",ng2?173:163,255),Blue=Number(ini,section,"TintB",253,255)
   };
  }
  public string Write(string ini,int costume,AfterimageMaterial material=AfterimageMaterial.Classic){
@@ -61,7 +69,7 @@ public sealed class AfterimagePreset {
    if(setting.Value<0||setting.Value>setting.Max)throw new ArgumentOutOfRangeException(setting.Key);
    ini=FeatureIni.Set(ini,section,setting.Key,setting.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
   }
-  if(material==AfterimageMaterial.Sigma2){
+  if(material!=AfterimageMaterial.Classic){
    if(SurfaceBrightness<0||SurfaceBrightness>MaxSurfaceBrightness)throw new ArgumentOutOfRangeException("SurfaceBrightness");
    ini=FeatureIni.Set(ini,section,"SurfaceBrightnessPercent",SurfaceBrightness.ToString(System.Globalization.CultureInfo.InvariantCulture));
   }
@@ -121,6 +129,7 @@ public sealed class FeatureFacade {
    info.MaxGlowStrength=info.AfterimageMaterials&&version>=new Version(0,6,9)?AfterimagePreset.MaxGlowStrength:100;
    info.MaxClassicGlowStrength=info.AfterimageMaterials&&version>=new Version(0,6,11)?AfterimagePreset.MaxGlowStrength:100;
    info.HasRenderProfiles=info.AfterimageMaterials&&version>=new Version(0,6,22);
+   info.HasNG2Material=info.AfterimageMaterials&&version>=new Version(0,6,23);
    info.RenderProfile=ReadRenderProfile(ini);
   }catch(Exception e){info.CanInstall=info.CanInstallAfterimage=false;info.Description=e.Message;}
   return info;
@@ -129,7 +138,8 @@ public sealed class FeatureFacade {
   var files=Payload.Load();string folder=DataRoot(root);var journal=Journal(folder);bool preserve=journal!=null;
   foreach(var file in files.Where(f=>f.Name.EndsWith(".ini",StringComparison.OrdinalIgnoreCase))){string installed=Path.Combine(folder,file.Name);if(preserve&&File.Exists(installed))file.Bytes=File.ReadAllBytes(installed);
    if(file.Name=="NGS1Rumble.ini"){
-    string text=Encoding.UTF8.GetString(file.Bytes).TrimStart('\uFEFF');text=FeatureIni.Set(text,"Rumble","Enabled",rumble?"1":"0");text=FeatureIni.Set(text,"DualSense","Enabled",ds?"1":"0");
+    string text=Encoding.UTF8.GetString(file.Bytes).TrimStart('\uFEFF');
+    text=FeatureIni.Set(text,"Rumble","Enabled",rumble?"1":"0");text=FeatureIni.Set(text,"DualSense","Enabled",ds?"1":"0");
     text=FeatureIni.Set(text,"Features","Rumble",rumble?"1":"0");text=FeatureIni.Set(text,"Features","DualSense",ds?"1":"0");text=FeatureIni.Set(text,"Features","AutoIcons",ds?"1":"0");
     text=FeatureIni.Set(text,"Features","Afterimage",afterimage?"1":"0");
     if(profile.HasValue)
@@ -196,11 +206,12 @@ public sealed class FeatureFacade {
   using(var guard=new FeatureLock(root)){
    var info=Inspect(root);
    if(!info.Afterimage||!info.CanInstallAfterimage)throw new Exception(InstallerLanguage.T("请先在这个目录安装残影补丁。", "Install afterimages for this game folder first."));
-   if(material==AfterimageMaterial.Sigma2&&!info.AfterimageMaterials)
+   if((material!=AfterimageMaterial.Classic&&!info.AfterimageMaterials)||
+      (material==AfterimageMaterial.NG2&&!info.HasNG2Material))
     throw new Exception(InstallerLanguage.T("请先更新残影补丁。","Update the afterimage patch first."));
-   bool sigma2=material==AfterimageMaterial.Sigma2;
-   if(preset.Brightness>(sigma2?info.MaxGlowStrength:info.MaxClassicGlowStrength)||
-    (sigma2&&preset.SurfaceBrightness>info.MaxSurfaceBrightness))
+   bool customSurface=material!=AfterimageMaterial.Classic;
+   if(preset.Brightness>(customSurface?info.MaxGlowStrength:info.MaxClassicGlowStrength)||
+    (customSurface&&preset.SurfaceBrightness>info.MaxSurfaceBrightness))
     throw new Exception(InstallerLanguage.T("请先点击「安装／更新残影」，再保存超过旧版上限的设置。",
      "Choose Install / Update Afterimages before saving values above the installed version's limits."));
    string file=PatchEngine.Child(info.ConfigRoot,"NGS1Rumble.ini");

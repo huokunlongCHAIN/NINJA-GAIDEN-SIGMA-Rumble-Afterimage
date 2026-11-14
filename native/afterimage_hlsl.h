@@ -83,6 +83,22 @@ constexpr char composite[] = R"(
         return b != 0 && ((abs(a - b) == 1 && min(a, b) != 5) ||
             (min(a, b) == 2 && max(a, b) == 6));
     }
+#if NG2_MATERIAL
+    float3 ng2Surface(float3 background, float3 detail, float opacity) {
+        float brightness = detail.x;
+        float patch = detail.y * 0.5 + 0.5;
+        float skin = detail.z * 0.5 + 0.5;
+        float crest = smoothstep(0.50, 0.96, brightness * 0.86 + patch * 0.14);
+        float3 tone = lerp(color.rgb * float3(0.74, 0.83, 1.0),
+                           lerp(color.rgb, float3(0.98, 0.99, 1.0), 0.87), crest);
+        float tint = opacity * surfaceBrightness * lerp(0.15, 0.32, brightness);
+        float glow = opacity * emission * (0.10 + crest * (0.56 + 1.06 * crest))
+            * lerp(1.0, lerp(0.78, 1.28, muscleHighlight), skin);
+        // A blue highlight can brighten the scene through the silhouette, but
+        // a dim patch must still transmit the scene without leaving a dark stripe.
+        return background + tone * ((1.0 - saturate(background)) * tint + glow);
+    }
+#endif
     float4 main(float4 pos : SV_Position) : SV_Target {
         uint w, h, maskWidth, maskHeight, slices;
         scene.GetDimensions(w,h);
@@ -100,20 +116,35 @@ constexpr char composite[] = R"(
         float2 size = float2(w,h);
         float3 original = 0;
         float3 glassColor = 0;
+#if NG2_MATERIAL
+        float3 ng2Color = 0;
+#endif
         [loop] for (uint i = 0; i < layerCount; ++i) {
             float4 surface = surfaceAt(maskPixel, i);
             int part = partOf(surface.x);
             if (part == 0) continue;
+#if NG2_MATERIAL
+            if (alpha == 0) ng2Color = scene.Load(int3(pixel, 0)).rgb;
+#else
             // The background is only needed by visible glass layers.
             if (glassRefraction >= 0 && alpha == 0) {
                 original = scene.Load(int3(pixel, 0)).rgb;
                 glassColor = original;
             }
+#endif
             float4 left = surfaceAt(maskPixel - int2(width,0), i);
             float4 right = surfaceAt(maskPixel + int2(width,0), i);
             float4 top = surfaceAt(maskPixel - int2(0,width), i);
             float4 bottom = surfaceAt(maskPixel + int2(0,width), i);
             float opacity = layerOpacity[i / 4][i % 4];
+#if NG2_MATERIAL
+            const float4 labels = float4(left.x, right.x, top.x, bottom.x);
+            const float4 samePart = 1 - saturate(abs(labels - surface.x));
+            const float4 present = float4(filled(left.xy), filled(right.xy), filled(top.xy), filled(bottom.xy));
+            const float4 weights = present * lerp(0.60, 1.0, samePart);
+            float3 detail = (surface.yzw * 3 + left.yzw * weights.x + right.yzw * weights.y +
+                top.yzw * weights.z + bottom.yzw * weights.w) / (3 + dot(weights, float4(1, 1, 1, 1)));
+#else
             if (jointOpacity < 1 &&
                 (connects(part, partOf(left.x)) || connects(part, partOf(right.x)) ||
                  connects(part, partOf(top.x)) || connects(part, partOf(bottom.x)))) opacity *= jointOpacity;
@@ -123,6 +154,7 @@ constexpr char composite[] = R"(
             float4 weights = 1 - saturate(abs(labels - surface.x));
             float brightness = (3 * surface.y + dot(neighbors, weights)) /
                 (3 + dot(weights, float4(1, 1, 1, 1)));
+#endif
             // Reduce coverage at the silhouette, especially at convex
             // corners. Internal material and anatomical seams stay solid.
             int2 x = int2(edgeRadius,0), y = int2(0,edgeRadius);
@@ -135,6 +167,10 @@ constexpr char composite[] = R"(
                 float edge = (4.0 + 2.0 * sides + corners) / 16.0;
                 opacity *= lerp(0.35, 1.0, smoothstep(0.20, 0.98, edge));
             }
+#if NG2_MATERIAL
+            ng2Color = ng2Surface(ng2Color, detail, opacity);
+            alpha += opacity;
+#else
             if (glassRefraction >= 0) {
                 // The shape bends the scene behind it. A weak lavender
                 // tint remains where the angle gives little refraction.
@@ -168,8 +204,12 @@ constexpr char composite[] = R"(
             float energy = opacity * emission * (0.11 + 1.72 * brightness * brightness) * highlight;
             light = tone * (coverage + energy) + light * (1 - coverage);
             alpha = coverage + alpha * (1 - coverage);
+#endif
         }
         if (alpha <= 0) discard;
+#if NG2_MATERIAL
+        return float4(ng2Color, 1);
+#else
         if (glassRefraction >= 0) return float4(glassColor, 1);
         original = scene.Load(int3(pixel, 0)).rgb;
         if (pixels <= 0) return float4(original * (1 - alpha) + light, 1);
@@ -183,10 +223,36 @@ constexpr char composite[] = R"(
         float3 bent = touchesPlayer ? original : scene.SampleLevel(linearSampler, shifted / size, 0).rgb;
         float3 glass = lerp(original, bent, saturate(alpha * 1.5));
         return float4(glass * (1 - alpha) + light, 1);
+#endif
     })";
 const std::string partLighting = std::string(SceneOcclusion) + R"(
     cbuffer Part : register(b11) { float id; float minimum; float range; }
-    cbuffer Viewport : register(b12) { float invHeight; }
+    cbuffer Viewport : register(b12) { float invHeight; float halfAspect; }
+#if NG2_MATERIAL
+    float hashCell(float2 cell) {
+        float3 seed = frac(float3(cell.x, cell.y, cell.x) * float3(0.1031, 0.11369, 0.13787));
+        seed += dot(seed, seed.yzx + 19.19);
+        return frac((seed.x + seed.y) * seed.z);
+    }
+    float smoothPatch(float2 pos) {
+        float2 cell = floor(pos);
+        float2 blend = smoothstep(0.0, 1.0, frac(pos));
+        float a = lerp(hashCell(cell), hashCell(cell + float2(1, 0)), blend.x);
+        float b = lerp(hashCell(cell + float2(0, 1)), hashCell(cell + 1), blend.x);
+        return lerp(lerp(a, b, blend.y), 0.5, smoothstep(0.24, 0.80, max(fwidth(pos.x), fwidth(pos.y))));
+    }
+    float ng2Pattern(float4 pos, float eyeDepth, int part, int mat) {
+        // Approximate view-space coordinates keep the detail in proportion to the model.
+        float2 p = (pos.xy * invHeight - float2(halfAspect - 0.14, 0.59)) * eyeDepth;
+        float2 scale = part == 1 ? float2(1.0, 1.18) :
+            mat == 1 || part >= 7 ? float2(1.25, 1.16) : float2(0.80, 1.0);
+        float2 q = float2(p.x + p.y * 0.24, p.y - p.x * 0.18) * 27.0 * scale;
+        q += float2(part * 2.43, mat * 5.23);
+        float broad = smoothPatch(q);
+        float detail = smoothPatch(q * 1.93 + float2(7.3, 13.1));
+        return broad * 0.79 + detail * 0.21;
+    }
+#endif
     float4 surface(float4 pos, float label, float low, float span) {
         occlude(pos);
         float z = rcp(max(abs(pos.w), 0.0001));
@@ -194,7 +260,17 @@ const std::string partLighting = std::string(SceneOcclusion) + R"(
         float diffuse = pow(saturate(dot(normal, float3(-0.42, 0.44, 0.794))), 1.35);
         float grazing = 1.0 - normal.z;
         float level = saturate(low + span * (diffuse * 0.76 + grazing * 0.24));
+#if NG2_MATERIAL
+        int part = (int)label & 15;
+        int mat = (int)label >> 4;
+        float region = part == 1 ? 0.39 : part == 3 ? 0.29 : part == 2 ? 0.23 : 0.16;
+        float patch = ng2Pattern(pos, z, part, mat);
+        float value = saturate(region + diffuse * 0.32 + grazing * 0.13 +
+            patch * 0.31 + (mat == 2 ? 0.13 : 0.0));
+        return float4(label / 255.0, value, patch, mat == 2 ? 1.0 : 0.0);
+#else
         return float4(label / 255.0, level, normal.xy * 0.5 + 0.5);
+#endif
     })";
 const std::string part = std::string(partLighting) + R"(
     float4 main(float4 pos : SV_Position) : SV_Target { return surface(pos, id, minimum, range); }
