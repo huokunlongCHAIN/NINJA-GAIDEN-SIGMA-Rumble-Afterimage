@@ -9,7 +9,7 @@ public sealed class PatchFile {
  public string Name,Hash;public byte[] Bytes;
 }
 public static class Payload {
- public const string Version="0.6.19";
+ public const string Version="0.6.22";
  public const string Core="0.7.5";
  public const string ExeName="NINJA GAIDEN SIGMA.exe";
  public const string ExeHash="15B7778118F8B1D0E0EE98A4DFF03DA9F99A3ABA4C7B3BF4F2CA157674B614C7";

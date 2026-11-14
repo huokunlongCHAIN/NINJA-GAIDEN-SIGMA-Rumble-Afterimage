@@ -57,6 +57,8 @@ static class IntegratedTests {
    Check(Payload.FileHash(rules)==ruleHash,"Afterimage upgrade changed rumble rules.");
    Check(features.LoadMaterial(root)==AfterimageMaterial.Classic&&features.LoadPreset(root,0).Opacity==29,
     "Upgrade changed the active material or classic settings.");
+   Check(installed.HasRenderProfiles&&installed.RenderProfile==AfterimageRenderProfile.Auto,
+    "Upgrade did not default to automatic rendering profile selection.");
    Console.WriteLine("PASS: in-place upgrade preserves controller flags, rumble rules and classic afterimages.");
 
    for(int i=0;i<5;++i){
@@ -83,6 +85,17 @@ static class IntegratedTests {
    Check(features.LoadMaterial(root)==AfterimageMaterial.Classic&&
     features.LoadPreset(root,0,AfterimageMaterial.Sigma2).SurfaceBrightness==120,"Changing material overwrote the Sigma2 preset.");
    Console.WriteLine("PASS: both materials keep independent presets for all five costumes.");
+   features.SaveRenderProfile(root,AfterimageRenderProfile.Integrated);
+   features.InstallRumble(root);
+   Check(features.Inspect(root).RenderProfile==AfterimageRenderProfile.Integrated&&
+    features.LoadPreset(root,0,AfterimageMaterial.Sigma2).SurfaceBrightness==120,
+    "Updating a feature lost the manual profile or the existing visual settings.");
+   features.InstallAfterimage(root,AfterimageRenderProfile.Standard);
+   Check(features.Inspect(root).RenderProfile==AfterimageRenderProfile.Standard,
+    "Install did not honor the selected profile.");
+   features.SaveRenderProfile(root,AfterimageRenderProfile.Auto);
+   Check(features.Inspect(root).RenderProfile==AfterimageRenderProfile.Auto,"Automatic mode was not persisted.");
+   Console.WriteLine("PASS: the selected render profile survives updates and can be changed independently of materials.");
 
    features.RestoreRumble(root);
    installed=features.Inspect(root);

@@ -67,40 +67,52 @@ constexpr char composite[] = R"(
         float surfaceBrightness;
     }
     cbuffer GhostColor : register(b13) { float4 color; }
+    static uint2 maskSize;
+    static float2 maskScale;
     float4 surfaceAt(int2 p, uint layer) {
+        if (any(p < 0) || any(p >= int2(maskSize))) return 0;
         float4 raw = parts.Load(int4(p, layer, 0));
         return float4(round(raw.x * 255.0), raw.y, raw.zw * 2.0 - 1.0);
     }
     int partOf(float label) { return (int)label & 15; }
     float filled(float2 surface) { return partOf(surface.x) != 0 ? 1.0 : 0.0; }
     bool playerAt(int2 p) {
-        return playerLayer != 0xffffffff && partOf(surfaceAt(p, playerLayer).x) != 0;
+        return playerLayer != 0xffffffff && partOf(surfaceAt(int2((float2(p) + 0.5) * maskScale), playerLayer).x) != 0;
     }
     bool connects(int a, int b) {
         return b != 0 && ((abs(a - b) == 1 && min(a, b) != 5) ||
             (min(a, b) == 2 && max(a, b) == 6));
     }
     float4 main(float4 pos : SV_Position) : SV_Target {
-        uint w, h;
+        uint w, h, maskWidth, maskHeight, slices;
         scene.GetDimensions(w,h);
+        parts.GetDimensions(maskWidth, maskHeight, slices);
+        maskSize = uint2(maskWidth, maskHeight);
+        maskScale = float2(maskSize) / float2(w,h);
         int2 pixel = int2(pos.xy);
         if (playerAt(pixel)) discard;
-        int width = max(1, (int)round(h / 430.0));
-        int edgeRadius = clamp((int)round(h / 650.0), 1, 3);
+        int2 maskPixel = int2(pos.xy * maskScale);
+        int width = max(1, (int)round(maskHeight / 430.0));
+        int edgeRadius = clamp((int)round(maskHeight / 650.0), 1, 3);
         float alpha = 0;
         float3 light = 0;
         float3 blue = color.rgb * float3(0.70, 0.83, 1.0);
         float2 size = float2(w,h);
-        float3 original = scene.Load(int3(pixel, 0)).rgb;
-        float3 glassColor = original;
+        float3 original = 0;
+        float3 glassColor = 0;
         [loop] for (uint i = 0; i < layerCount; ++i) {
-            float4 surface = surfaceAt(pixel, i);
+            float4 surface = surfaceAt(maskPixel, i);
             int part = partOf(surface.x);
             if (part == 0) continue;
-            float4 left = surfaceAt(pixel - int2(width,0), i);
-            float4 right = surfaceAt(pixel + int2(width,0), i);
-            float4 top = surfaceAt(pixel - int2(0,width), i);
-            float4 bottom = surfaceAt(pixel + int2(0,width), i);
+            // The background is only needed by visible glass layers.
+            if (glassRefraction >= 0 && alpha == 0) {
+                original = scene.Load(int3(pixel, 0)).rgb;
+                glassColor = original;
+            }
+            float4 left = surfaceAt(maskPixel - int2(width,0), i);
+            float4 right = surfaceAt(maskPixel + int2(width,0), i);
+            float4 top = surfaceAt(maskPixel - int2(0,width), i);
+            float4 bottom = surfaceAt(maskPixel + int2(0,width), i);
             float opacity = layerOpacity[i / 4][i % 4];
             if (jointOpacity < 1 &&
                 (connects(part, partOf(left.x)) || connects(part, partOf(right.x)) ||
@@ -115,11 +127,11 @@ constexpr char composite[] = R"(
             // corners. Internal material and anatomical seams stay solid.
             int2 x = int2(edgeRadius,0), y = int2(0,edgeRadius);
             float sides = edgeRadius == width ? filled(left.xy) + filled(right.xy) + filled(top.xy) + filled(bottom.xy) :
-                filled(surfaceAt(pixel-x,i).xy) + filled(surfaceAt(pixel+x,i).xy) +
-                filled(surfaceAt(pixel-y,i).xy) + filled(surfaceAt(pixel+y,i).xy);
+                filled(surfaceAt(maskPixel-x,i).xy) + filled(surfaceAt(maskPixel+x,i).xy) +
+                filled(surfaceAt(maskPixel-y,i).xy) + filled(surfaceAt(maskPixel+y,i).xy);
             if (sides < 4) {
-                float corners = filled(surfaceAt(pixel-x-y,i).xy) + filled(surfaceAt(pixel+x-y,i).xy) +
-                    filled(surfaceAt(pixel-x+y,i).xy) + filled(surfaceAt(pixel+x+y,i).xy);
+                float corners = filled(surfaceAt(maskPixel-x-y,i).xy) + filled(surfaceAt(maskPixel+x-y,i).xy) +
+                    filled(surfaceAt(maskPixel-x+y,i).xy) + filled(surfaceAt(maskPixel+x+y,i).xy);
                 float edge = (4.0 + 2.0 * sides + corners) / 16.0;
                 opacity *= lerp(0.35, 1.0, smoothstep(0.20, 0.98, edge));
             }
@@ -159,6 +171,7 @@ constexpr char composite[] = R"(
         }
         if (alpha <= 0) discard;
         if (glassRefraction >= 0) return float4(glassColor, 1);
+        original = scene.Load(int3(pixel, 0)).rgb;
         if (pixels <= 0) return float4(original * (1 - alpha) + light, 1);
         float2 p = pos.xy * (720.0 / h);
         float2 wave = float2(sin(p.y * 0.055 + time), cos(p.x * 0.05 - time));
@@ -185,6 +198,12 @@ const std::string partLighting = std::string(SceneOcclusion) + R"(
     })";
 const std::string part = std::string(partLighting) + R"(
     float4 main(float4 pos : SV_Position) : SV_Target { return surface(pos, id, minimum, range); }
+)";
+const std::string playerCoverage = std::string(SceneOcclusion) + R"(
+    float4 main(float4 pos : SV_Position) : SV_Target {
+        occlude(pos);
+        return float4(1.0 / 255.0, 0, 0, 0);
+    }
 )";
 // Only the finger and palm islands of albedo 21 contain skin.
 const std::string glove = std::string(partLighting) + R"(

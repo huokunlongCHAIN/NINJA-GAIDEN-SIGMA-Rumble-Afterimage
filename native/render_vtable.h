@@ -18,10 +18,15 @@ struct Slot {
     void (*log)(const char*, ...) = nullptr;
     std::atomic<bool>* retired = nullptr;
     std::atomic<void*>* currentOriginal = nullptr;
+    bool writable = false;
 
     void* Next() const { return currentOriginal ? currentOriginal->load() : original; }
 
     bool Exchange(void* expected, void* replacement, bool allowAlreadySet = false) const {
+        if (writable) {
+            const auto prior = InterlockedCompareExchangePointer(address, replacement, expected);
+            return prior == expected || (allowAlreadySet && prior == replacement);
+        }
         std::lock_guard<std::mutex> guard(writes);
         DWORD protection;
         if (!VirtualProtect(address, sizeof(*address), PAGE_READWRITE, &protection)) return false;

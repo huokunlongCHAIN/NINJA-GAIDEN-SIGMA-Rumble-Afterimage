@@ -81,6 +81,7 @@ void CheckClearForwarding() {
 // Match the state at presentation: opaque scene props have already filled the target.
 int main() {
     logFile = stdout;
+    settings.renderProfile = RenderProfile::Standard;
     settings.glassVisual = false;
     constexpr UINT Size = 128;
     const HWND window = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, Size, Size, nullptr, nullptr, nullptr, nullptr);
@@ -145,13 +146,29 @@ int main() {
     auto** table = RenderVtable::Table(deferred.Get());
     auto* observedViewport = table[Viewports];
     const auto& slot = *originals.at(table + Viewports);
+    if (slot.writable) {
+        const auto fastBefore = activity.fastRebind;
+        assert(slot.Restore());
+        assert(ObservePrepareGameDraw(worker.data(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST));
+        assert(activity.fastRebind > fastBefore);
+    }
     std::atomic<void*> dispatch{reinterpret_cast<void*>(TestGameDrawPreparation)};
     void* testSlot = reinterpret_cast<void*>(AlternateViewport);
     std::atomic<bool> retired{false};
     const RenderVtable::Slot replacement{&testSlot, reinterpret_cast<void*>(TestGameDrawPreparation),
         observedViewport, Viewports, nullptr, &retired, &dispatch};
-    assert(RebindContextSlot(replacement));
+    std::array<void*, 2> verified{};
+    const auto checksBefore = activity.rebindChecks;
+    assert(RebindContextSlot(replacement, &verified));
     assert(replacement.Next() == reinterpret_cast<void*>(AlternateViewport) && testSlot == observedViewport);
+    testSlot = replacement.original;
+    assert(RebindContextSlot(replacement, &verified));
+    testSlot = reinterpret_cast<void*>(AlternateViewport);
+    assert(RebindContextSlot(replacement, &verified));
+    assert(activity.rebindChecks == checksBefore + 2 && replacement.Next() == reinterpret_cast<void*>(AlternateViewport));
+    testSlot = nullptr;
+    assert(!RebindContextSlot(replacement, &verified));
+    testSlot = observedViewport;
     assert(replacement.Restore());
     assert(slot.Restore());
     assert(ObservePrepareGameDraw(worker.data(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST));
@@ -199,7 +216,6 @@ int main() {
     packet.strides[0] = 2 * sizeof(FLOAT);
     packet.indexFormat = DXGI_FORMAT_R16_UINT;
     packet.topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    packet.color = res.colors.back();
     ComPtr<ID3D11Buffer> left, right;
     const FLOAT leftPositions[]{-0.8f, -0.8f, 0, 0.8f, 0, -0.8f};
     const FLOAT rightPositions[]{0, -0.8f, 0, 0.8f, 0.8f, -0.8f};
@@ -244,19 +260,22 @@ int main() {
             }
         }
         packet.pose.renderFrame = renderFrame;
-        packet.anchorOpacity = anchorOpacity;
-        packet.color = res.colors[fadeStep];
-        packet.opacity = anchorOpacity > 0 ? anchorOpacity : 0.48f * (fadeStep + 1) / FadeSteps;
+        const auto opacity = anchorOpacity > 0 ? anchorOpacity : 0.48f * (fadeStep + 1) / FadeSteps;
         packet.material = material;
         packet.shader = settings.glassVisual ? curvedShader :
             (material == GhostMaterial::GripAtlas ? gripVertex : defaultVertex);
-        res.overlayDraws = {packet, packet};
+        auto first = packet, second = packet;
         if (seam) {
-            res.overlayDraws[0].pose.vertices[0] = left;
-            res.overlayDraws[0].bodyPart = BodyPart::Head;
-            res.overlayDraws[1].pose.vertices[0] = right;
-            res.overlayDraws[1].bodyPart = BodyPart::Torso;
+            first.pose.vertices[0] = left;
+            first.bodyPart = BodyPart::Head;
+            second.pose.vertices[0] = right;
+            second.bodyPart = BodyPart::Torso;
         }
+        auto* color = res.colors[fadeStep].Get();
+        PoseFrame pose;
+        pose.parts = {first, second};
+        pose.count = 2;
+        res.overlayPoses = {{&pose, color, opacity, anchorOpacity > 0}};
         if (playerFront) {
             res.playerFront.Begin(renderFrame, PoseClockUs());
             res.playerFront.parts = {packet};
@@ -264,7 +283,7 @@ int main() {
             res.playerFront.count = 1;
         }
         assert(RenderOverlay(swap.Get(), device.Get(), res));
-        res.overlayDraws.clear();
+        res.overlayPoses.clear();
         ++renderFrame;
         ComPtr<ID3D11RenderTargetView> restored;
         immediate->OMGetRenderTargets(1, restored.GetAddressOf(), nullptr);
@@ -305,7 +324,7 @@ int main() {
                 assert(row[63 * 4] == 0 && row[64 * 4] == 255);
             }
             puts("Refraction did not sample the front character into the background.");
-        } else if (playerFront && !settings.glassVisual) {
+        } else if (playerFront && !settings.glassVisual && res.refraction.maskWidth == Size && strength == 0) {
             const auto* row = pixels + 64 * mapped.RowPitch;
             const std::array<BYTE, 4> liveColor{0, 255, 0, 84};
             assert(std::equal(liveColor.begin(), liveColor.end(), row + 64 * 4));
@@ -394,23 +413,47 @@ int main() {
     stomp.parts = {packet};
     stomp.count = 1;
     BuildOverlayDraws(res, now);
-    assert(res.overlayDraws.size() == 11);
-    assert(std::abs(res.overlayDraws.front().anchorOpacity - settings.alpha / 200.0f) < 0.001f);
-    for (unsigned i = 1; i < res.overlayDraws.size(); i += 2) {
-        assert(res.overlayDraws[i].pose.renderFrame == res.overlayDraws[i + 1].pose.renderFrame);
-        if (i > 1) assert(res.overlayDraws[i - 1].pose.renderFrame < res.overlayDraws[i].pose.renderFrame);
+    assert(res.overlayPoses.size() == 6);
+    assert(res.overlayPoses.front().anchor);
+    assert(std::abs(res.overlayPoses.front().opacity - settings.alpha / 200.0f) < 0.001f);
+    for (unsigned i = 1; i < res.overlayPoses.size(); ++i) {
+        assert(res.overlayPoses[i].pose->count == 2);
+        assert(res.overlayPoses[i - 1].pose->frame < res.overlayPoses[i].pose->frame);
     }
+    const auto full = res.overlayPoses;
+    settings.renderProfile = RenderProfile::Auto;
+    graphicsAdapter = GraphicsAdapter::Integrated;
+    assert(BudgetOverlayPoses(res.overlayPoses) == 4);
+    assert(res.overlayPoses.size() == 2 && res.overlayPoses.front().pose == full.front().pose &&
+        res.overlayPoses.back().pose == full.back().pose);
+    res.overlayPoses.assign(full.begin() + 1, full.end());
+    assert(BudgetOverlayPoses(res.overlayPoses) == 3);
+    assert(res.overlayPoses.front().pose == full[1].pose && res.overlayPoses.back().pose == full.back().pose);
+    settings.renderProfile = RenderProfile::Standard;
+    res.overlayPoses = full;
+    assert(BudgetOverlayPoses(res.overlayPoses) == 0 && res.overlayPoses.size() == 6);
+    settings.renderProfile = RenderProfile::Auto;
+    graphicsAdapter = GraphicsAdapter::Discrete;
+    assert(!LimitGhostLayers());
+    settings.renderProfile = RenderProfile::Integrated;
+    assert(LimitGhostLayers());
+    settings.renderProfile = RenderProfile::Auto;
+    using GraphicsAdapterDetection::ClassifyLegacy;
+    assert(ClassifyLegacy(0x8086, 128 << 20, SIZE_T{4} << 30) == GraphicsAdapter::Integrated);
+    assert(ClassifyLegacy(0x1002, 512 << 20, SIZE_T{4} << 30) == GraphicsAdapter::Integrated);
+    assert(ClassifyLegacy(0x8086, SIZE_T{8} << 30, SIZE_T{4} << 30) == GraphicsAdapter::Discrete);
+    assert(ClassifyLegacy(0x10de, 0, SIZE_T{4} << 30) == GraphicsAdapter::Discrete);
     for (unsigned age = 0; age < 10; ++age) assert(StompAlpha(age) == 1);
     for (unsigned age = 10; age < 28; ++age)
         assert(std::abs(StompAlpha(age) - float(27 - age) / 18.0f) < 0.001f);
     assert(StompAlpha(28) == 0);
-    res.overlayDraws.clear();
+    res.overlayPoses.clear();
     auto& laterStomp = res.stompOrigins[1];
     laterStomp.Begin(renderFrame, now);
     laterStomp.parts = {packet};
     laterStomp.count = 1;
     BuildOverlayDraws(res, now);
-    assert(res.overlayDraws.size() == 12 && res.overlayDraws[1].anchorOpacity == settings.alpha / 100.0f);
+    assert(res.overlayPoses.size() == 7 && res.overlayPoses[1].opacity == settings.alpha / 100.0f);
     ResetPoses();
     auto& release = res.chargeOrigin;
     release.Begin(20, now);
@@ -428,17 +471,19 @@ int main() {
     effectFrame.leading = true;
     renderFrame = res.cameraFrame = 72;
     BuildOverlayDraws(res, now);
-    assert(res.overlayDraws.size() == 3);
-    assert(std::abs(res.overlayDraws[1].opacity - settings.alpha / 900.0f) < 0.001f);
-    res.overlayDraws.clear();
+    assert(res.overlayPoses.size() == 3);
+    assert(std::abs(res.overlayPoses[1].opacity - settings.alpha / 900.0f) < 0.001f);
+    res.overlayPoses.clear();
     effectFrame.leading = false;
     renderFrame = res.cameraFrame = 82;
     BuildOverlayDraws(res, now);
-    assert(res.overlayDraws.size() == 1 && res.overlayDraws.front().anchorOpacity > 0);
-    res.overlayDraws.clear();
+    assert(res.overlayPoses.size() == 1 && res.overlayPoses.front().opacity > 0);
+    res.overlayPoses.clear();
     renderFrame = res.cameraFrame = 83;
     BuildOverlayDraws(res, now);
-    assert(res.overlayDraws.empty());
+    assert(res.overlayPoses.empty());
+    UpdatePoseCapture(res, now, false, false);
+    assert(!res.capturePose && !res.captureFront);
     ResetPoses();
     airCombo.branch = 1351;
     auto& airOrigin = res.airOrigins[0];
@@ -453,15 +498,15 @@ int main() {
     }
     renderFrame = res.cameraFrame = 43;
     BuildOverlayDraws(res, now);
-    assert(res.overlayDraws.size() == 4 && res.overlayDraws.front().anchorOpacity > settings.alpha / 300.0f);
-    res.overlayDraws.clear();
+    assert(res.overlayPoses.size() == 4 && res.overlayPoses.front().opacity > settings.alpha / 300.0f);
+    res.overlayPoses.clear();
     renderFrame = res.cameraFrame = 65;
     BuildOverlayDraws(res, now);
-    assert(res.overlayDraws.size() == 1 && res.overlayDraws.front().anchorOpacity > 0);
-    res.overlayDraws.clear();
+    assert(res.overlayPoses.size() == 1 && res.overlayPoses.front().opacity > 0);
+    res.overlayPoses.clear();
     renderFrame = res.cameraFrame = 66;
     BuildOverlayDraws(res, now);
-    assert(res.overlayDraws.empty());
+    assert(res.overlayPoses.empty());
     for (unsigned age = 0; age <= AirFadeFrames; ++age)
         assert(std::abs(AirFade(age) - float(AirFadeFrames - age) / AirFadeFrames) < 0.001f);
     assert(AirOriginFade(4) == 1 && AirOriginFade(17) == 0.36f && AirOriginFade(AirOriginFrames) == 0);
@@ -617,13 +662,33 @@ int main() {
         immediate->CopyResource(depthTexture.Get(), splitScene.Get());
     }
     intelAdapter = true;
+    graphicsAdapter = GraphicsAdapter::Integrated;
     assert(!SceneDepthEnabled());
     const auto withoutDepthCopy = draw(100);
+    assert(res.refraction.maskWidth == Size / 2 && res.refraction.maskHeight == Size / 2);
+    assert(res.coverageDesc.Width == Size / 2 && res.refraction.surface.Width == Size);
     assert(withoutDepthCopy[6] != prop && withoutDepthCopy[0] != prop);
+    for (bool sigma2 : {false, true}) {
+        settings.glassVisual = sigma2;
+        draw(100);
+        auto* mask = res.refraction.maskView.Get();
+        assert(res.refraction.slices.size() >= settings.copies + 1);
+        const auto result = draw(100, 0, FadeSteps - 1, 0, false, true);
+        assert(res.refraction.maskView.Get() == mask);
+        assert(result[6] != prop && result[0] == prop);
+    }
+    settings.renderProfile = RenderProfile::Standard;
+    draw(100);
+    assert(res.refraction.maskWidth == Size && res.coverageDesc.Width == Size);
+    assert(!SceneDepthEnabled());
+    settings.renderProfile = RenderProfile::Auto;
     settings.sceneDepthMode = 2;
+    assert(!SceneDepthEnabled());
+    intelDepthHook = true;
     const auto forcedDepth = draw(100);
     assert(forcedDepth[6] == prop && forcedDepth[0] != prop);
     settings.sceneDepthMode = 0;
+    intelDepthHook = false;
     ComPtr<Context> intelPath;
     assert(SUCCEEDED(device->CreateDeferredContext(0, intelPath.GetAddressOf())));
     auto** intelTable = RenderVtable::Table(intelPath.Get());
@@ -631,6 +696,7 @@ int main() {
     assert(originals.count(intelTable + Indexed));
     intelAdapter = false;
     puts("Intel automatic mode leaves the depth-clear slot untouched and retains indexed drawing observation.");
+    puts("Both materials composite half-resolution masks at full resolution, preserve player occlusion, and reuse mask layers.");
     puts("Both materials hide the part of a pose behind scene depth, including depth cleared before Present.");
     puts("Glass style preserves background detail, bends it along the surface, and protects the live silhouette.");
     hooksReady = false;

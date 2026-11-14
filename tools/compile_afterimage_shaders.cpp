@@ -18,7 +18,8 @@ int main(int argc, char** argv) {
         {"GripUnderlay", gripUnderlay, "ps_5_0"},
         {"Mask", "float4 main():SV_Target{return 1;}", "ps_5_0"},
         {"Fullscreen", fullscreen, "vs_5_0"}, {"Composite", composite, "ps_5_0"},
-        {"Part", part, "ps_5_0"}, {"Glove", glove, "ps_5_0"}, {"Grip", grip, "ps_5_0"}
+        {"Part", part, "ps_5_0"}, {"Glove", glove, "ps_5_0"}, {"Grip", grip, "ps_5_0"},
+        {"PlayerCoverage", playerCoverage, "ps_5_0"}
     };
     for (const auto& shader : shaders) {
         ComPtr<ID3DBlob> code, errors;

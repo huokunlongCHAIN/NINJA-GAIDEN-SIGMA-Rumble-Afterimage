@@ -10,8 +10,11 @@ namespace NgsRumblePatch {
 public sealed class FeatureInspection {
  public string Root,Description,ConfigRoot;public bool CanInstall,CanInstallAfterimage,CanRestore,Rumble,DualSense,Afterimage,AfterimageMaterials;
  public int MaxSurfaceBrightness=100,MaxGlowStrength=100,MaxClassicGlowStrength=100;
+ public bool HasRenderProfiles;
+ public AfterimageRenderProfile RenderProfile;
 }
 public enum AfterimageMaterial { Classic, Sigma2 }
+public enum AfterimageRenderProfile { Auto, Standard, Integrated }
 public sealed class AfterimagePreset {
  public const int MaxSurfaceBrightness=200;
  public const int MaxGlowStrength=200;
@@ -92,6 +95,17 @@ public sealed class FeatureFacade {
   public void Dispose(){mutex.ReleaseMutex();mutex.Dispose();}
  }
  static PatchState Journal(string folder){string file=Path.Combine(folder,Payload.StateFolder,"state.json");if(!File.Exists(file))return null;var state=new JavaScriptSerializer().Deserialize<PatchState>(File.ReadAllText(file));return state!=null&&state.Product=="NGS1RumblePatch"&&state.Schema==1&&state.Phase=="Installed"?state:null;}
+ static AfterimageRenderProfile ReadRenderProfile(string ini) {
+  var value=FeatureIni.Get(ini,"Afterimage","RenderProfile","");
+  if(value.Equals("Standard",StringComparison.OrdinalIgnoreCase))return AfterimageRenderProfile.Standard;
+  if(value.Equals("Integrated",StringComparison.OrdinalIgnoreCase))return AfterimageRenderProfile.Integrated;
+  if(value.Length==0){
+   var legacy=FeatureIni.Get(ini,"Afterimage","LayerBudgetMode","0");
+   if(legacy=="1")return AfterimageRenderProfile.Integrated;
+   if(legacy=="2")return AfterimageRenderProfile.Standard;
+  }
+  return AfterimageRenderProfile.Auto;
+ }
  public FeatureInspection Inspect(string input){
   var basic=core.Inspect(input);var info=new FeatureInspection{Root=basic.Root,Description=basic.Description,CanInstall=basic.CanInstall,CanRestore=basic.CanRestore};
   if(String.IsNullOrEmpty(info.Root))return info;
@@ -106,16 +120,20 @@ public sealed class FeatureFacade {
    info.MaxSurfaceBrightness=info.AfterimageMaterials&&version>=new Version(0,6,8)?AfterimagePreset.MaxSurfaceBrightness:100;
    info.MaxGlowStrength=info.AfterimageMaterials&&version>=new Version(0,6,9)?AfterimagePreset.MaxGlowStrength:100;
    info.MaxClassicGlowStrength=info.AfterimageMaterials&&version>=new Version(0,6,11)?AfterimagePreset.MaxGlowStrength:100;
+   info.HasRenderProfiles=info.AfterimageMaterials&&version>=new Version(0,6,22);
+   info.RenderProfile=ReadRenderProfile(ini);
   }catch(Exception e){info.CanInstall=info.CanInstallAfterimage=false;info.Description=e.Message;}
   return info;
  }
- List<PatchFile> SelectPayload(string root,bool rumble,bool ds,bool afterimage){
+ List<PatchFile> SelectPayload(string root,bool rumble,bool ds,bool afterimage,AfterimageRenderProfile? profile){
   var files=Payload.Load();string folder=DataRoot(root);var journal=Journal(folder);bool preserve=journal!=null;
   foreach(var file in files.Where(f=>f.Name.EndsWith(".ini",StringComparison.OrdinalIgnoreCase))){string installed=Path.Combine(folder,file.Name);if(preserve&&File.Exists(installed))file.Bytes=File.ReadAllBytes(installed);
    if(file.Name=="NGS1Rumble.ini"){
     string text=Encoding.UTF8.GetString(file.Bytes).TrimStart('\uFEFF');text=FeatureIni.Set(text,"Rumble","Enabled",rumble?"1":"0");text=FeatureIni.Set(text,"DualSense","Enabled",ds?"1":"0");
     text=FeatureIni.Set(text,"Features","Rumble",rumble?"1":"0");text=FeatureIni.Set(text,"Features","DualSense",ds?"1":"0");text=FeatureIni.Set(text,"Features","AutoIcons",ds?"1":"0");
     text=FeatureIni.Set(text,"Features","Afterimage",afterimage?"1":"0");
+    if(profile.HasValue)
+     text=FeatureIni.Set(text,"Afterimage","RenderProfile",profile.Value.ToString());
     if(preserve&&journal.Version=="0.6.6-visual-test.1"){
      for(int i=0;i<AfterimagePreset.Sections.Length;i++)
       text=AfterimagePreset.Read(text,i).Write(text,i,AfterimageMaterial.Sigma2);
@@ -127,17 +145,17 @@ public sealed class FeatureFacade {
   }
   return files;
  }
- public string Change(string input,bool? rumble,bool? ds,bool? afterimage=null){
+ public string Change(string input,bool? rumble,bool? ds,bool? afterimage=null,AfterimageRenderProfile? profile=null){
   string root=PatchEngine.Root(input);
-  using(var guard=new FeatureLock(root))return ChangeLocked(root,rumble,ds,afterimage);
+  using(var guard=new FeatureLock(root))return ChangeLocked(root,rumble,ds,afterimage,profile);
  }
- string ChangeLocked(string root,bool? rumble,bool? ds,bool? afterimage){
+ string ChangeLocked(string root,bool? rumble,bool? ds,bool? afterimage,AfterimageRenderProfile? profile){
   AutoLifecycle.RequireGameStopped(root);var current=Inspect(root);
   bool nextRumble=rumble??current.Rumble,nextDS=ds??current.DualSense,nextAfterimage=afterimage??current.Afterimage;
   if(!nextRumble&&!nextDS&&!nextAfterimage)return core.Restore(root);
   GameCompatibility.Validate(Path.Combine(root,Payload.ExeName));if(!current.CanInstall)throw new Exception(current.Description);
   if(nextAfterimage&&!current.CanInstallAfterimage)throw new Exception(InstallerLanguage.T("此游戏构建的渲染入口尚未验证。请确认未安装其他会修改游戏程序的补丁。", "The rendering entry point for this game build has not been verified. Check whether another patch modified the executable."));
-  var selected=SelectPayload(root,nextRumble,nextDS,nextAfterimage);var compatibility=GameCompatibility.Inspect(Path.Combine(root,Payload.ExeName));
+  var selected=SelectPayload(root,nextRumble,nextDS,nextAfterimage,profile);var compatibility=GameCompatibility.Inspect(Path.Combine(root,Payload.ExeName));
   string message=compatibility.Family=="original-code"?LaunchEngine.Install(root,true,selected):new PatchEngine(null,selected).Install(root);
   return String.Format(InstallerLanguage.T(
    "震动 {0} · PS5 手柄 {1} · 残影 {2}。\r\n可直接打开游戏 EXE，或点击“启动游戏”。\r\n{3}",
@@ -150,6 +168,19 @@ public sealed class FeatureFacade {
  public string RestoreRumble(string root){return Change(root,false,null);}
  public string RestoreDualSense(string root){return Change(root,null,false);}
  public string InstallAfterimage(string root){return Change(root,null,null,true);}
+ public string InstallAfterimage(string root,AfterimageRenderProfile profile){return Change(root,null,null,true,profile);}
+ public string SaveRenderProfile(string input,AfterimageRenderProfile profile){
+  string root=PatchEngine.Root(input);
+  using(var guard=new FeatureLock(root)){
+   var info=Inspect(root);
+   if(!info.Afterimage||!info.CanInstallAfterimage||!info.HasRenderProfiles)
+    throw new InvalidOperationException(InstallerLanguage.T("请先安装或更新残影补丁。","Install or update Afterimages first."));
+   string file=PatchEngine.Child(info.ConfigRoot,"NGS1Rumble.ini");
+   var text=FeatureIni.Set(File.ReadAllText(file),"Afterimage","RenderProfile",profile.ToString());
+   PatchEngine.AtomicWrite(file,new UTF8Encoding(false).GetBytes(text));
+  }
+  return InstallerLanguage.T("残影渲染模式已保存。游戏运行中会自动应用。","Render profile saved. A running game applies it automatically.");
+ }
  public string RestoreAfterimage(string root){return Change(root,null,null,false);}
  public string RestoreAll(string input){string root=PatchEngine.Root(input);using(var guard=new FeatureLock(root))return core.Restore(root);}
  string ReadAfterimageIni(string input){

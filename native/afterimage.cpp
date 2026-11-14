@@ -27,6 +27,7 @@
 #include "costumes.h"
 #include "render_hook_bridge.h"
 #include "render_vtable.h"
+#include "graphics_adapter.h"
 #include "afterimage_shaders.generated.h"
 
 namespace {
@@ -47,6 +48,7 @@ constexpr unsigned CaptureLimit = 320;
 constexpr unsigned FadeSteps = 24;
 constexpr unsigned PoseHistorySize = 12;
 constexpr unsigned MaxGhostLayers = 12;
+constexpr unsigned IntegratedGhostLayers = 2;
 constexpr unsigned MaxSurfaceBrightness = 200;
 constexpr unsigned MaxGlowStrength = 200;
 
@@ -105,13 +107,10 @@ struct OverlayDraw {
     ComPtr<ID3D11VertexShader> shader;
     ComPtr<ID3D11InputLayout> layout;
     ComPtr<ID3D11Buffer> index;
-    ComPtr<ID3D11Buffer> color;
     std::array<UINT, VertexSlots> strides{}, offsets{};
     D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
     DXGI_FORMAT indexFormat = DXGI_FORMAT_UNKNOWN;
     UINT indexOffset = 0;
-    float anchorOpacity = 0;
-    float opacity = 0.48f;
     BodyPart bodyPart = BodyPart::Torso;
     GhostMaterial material = GhostMaterial::Fabric;
     uint64_t meshKey = 0;
@@ -135,12 +134,20 @@ struct PoseFrame {
     }
 };
 
+struct QueuedPose {
+    const PoseFrame* pose;
+    ID3D11Buffer* color;
+    float opacity;
+    bool anchor;
+};
+
 struct Readback {
     unsigned id;
     ComPtr<ID3D11Texture2D> texture;
 };
 
 struct ContextState {
+    ID3D11Device* device = nullptr; // The context owns a reference to its device.
     std::array<VertexBinding, VertexSlots> vertices;
     std::array<ID3D11Buffer*, ConstantSlots> vsConstants{};
     ID3D11Buffer* index = nullptr;
@@ -169,7 +176,7 @@ struct ContextState {
 
 struct RefractionResources {
     ComPtr<ID3D11VertexShader> fullscreen;
-    ComPtr<ID3D11PixelShader> composite, partShader, gloveShader, gripShader;
+    ComPtr<ID3D11PixelShader> composite, partShader, gloveShader, gripShader, playerCoverage;
     ComPtr<ID3D11SamplerState> linearSampler;
     ComPtr<ID3D11BlendState> rgbBlend;
     ComPtr<ID3D11Texture2D> scene;
@@ -179,6 +186,7 @@ struct RefractionResources {
     std::array<ComPtr<ID3D11Buffer>, 8 * 3> partLabels;
     std::vector<ComPtr<ID3D11RenderTargetView>> slices;
     D3D11_TEXTURE2D_DESC surface{};
+    UINT maskWidth = 0, maskHeight = 0;
     DXGI_FORMAT maskFormat = DXGI_FORMAT_UNKNOWN;
     bool unavailable = false;
 };
@@ -197,10 +205,12 @@ struct SceneDepth {
 
 struct OverlayCoverageProbe {
     ComPtr<ID3D11Query> geometry, composite;
+    ComPtr<ID3D11Query> frequency, start, end;
     uint64_t frame = 0;
     unsigned samples = 0;
     unsigned draws = 0;
     bool pending = false;
+    bool timed = false;
     bool sceneDepth = false;
 };
 
@@ -226,13 +236,15 @@ struct DeviceResources {
     RefractionResources refraction;
     SceneDepth sceneDepth;
     OverlayCoverageProbe coverageProbe;
-    std::vector<OverlayDraw> overlayDraws;
+    std::vector<QueuedPose> overlayPoses;
     std::array<PoseFrame, PoseHistorySize> trail;
     unsigned nextTrail = 0;
     PoseFrame chargeOrigin;
     PoseFrame leadingPose;
     PoseFrame playerFront;
-    uint64_t playerFrontUntilUs = 0;
+    uint64_t frontDecisionFrame = UINT64_MAX;
+    bool captureFront = false;
+    bool capturePose = false;
     std::array<PoseFrame, 4> stompOrigins;
     std::array<PoseFrame, 3> airOrigins;
     std::array<PoseFrame, AirTrailCount * 2> airTrail;
@@ -245,6 +257,7 @@ struct DeviceResources {
 };
 
 enum class Action { None, ET, UT, WindRun, WallDownslash, FlyingSwallow, WhiteFeather };
+enum class RenderProfile { Auto, Standard, Integrated };
 
 struct Appearance {
     unsigned alpha = 40;
@@ -263,6 +276,7 @@ struct Settings {
     bool autoSwallow = true;
     bool autoWhiteFeather = true;
     unsigned sceneDepthMode = 0;
+    RenderProfile renderProfile = RenderProfile::Auto;
     unsigned interval = 12;
     unsigned lifetime = 185;
     unsigned copies = 5;
@@ -334,9 +348,25 @@ unsigned loggedStompPhases = 0;
 struct RenderActivity {
     unsigned long long indexed = 0, stateReady = 0, costume = 0, sceneColor = 0, presented = 0;
     unsigned long long prepared = 0, rebound = 0;
+    unsigned long long fastRebind = 0;
+    unsigned long long rebindChecks = 0;
+    unsigned long long overlayFrames = 0, overlayCpuUs = 0, peakOverlayCpuUs = 0;
+    unsigned long long peakGhostDraws = 0, peakFrontDraws = 0, skippedGhostLayers = 0;
+    struct Cadence {
+        unsigned long long frames = 0, over18Ms = 0, over25Ms = 0, peakUs = 0;
+
+        void Record(unsigned long long elapsedUs) {
+            ++frames;
+            over18Ms += elapsedUs > 18000;
+            over25Ms += elapsedUs > 25000;
+            peakUs = std::max(peakUs, elapsedUs);
+        }
+    } cadenceWithOverlay, cadenceWithoutOverlay;
     D3D11_VIEWPORT viewport{};
 };
 RenderActivity activity;
+uint64_t lastPresentUs = 0;
+bool lastPresentHadOverlay = false;
 GameFrame originalGameFrame = nullptr;
 PrepareGameDraw originalPrepareGameDraw = nullptr;
 bool gameWorkerLayoutVerified = false;
@@ -346,6 +376,8 @@ std::atomic<bool> hooksReady{false};
 thread_local bool drawingExtra = false;
 thread_local bool forwardingIndexed = false;
 bool intelAdapter = false;
+GraphicsAdapter graphicsAdapter = GraphicsAdapter::Unknown;
+bool intelDepthHook = false;
 bool loggedCameraCopy = false;
 bool loggedDepthSetup = false;
 bool loggedDepthCopy = false;
@@ -353,6 +385,30 @@ bool loggedDepthCopy = false;
 uint64_t PoseClockUs() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+bool LimitGhostLayers() {
+    if (settings.renderProfile != RenderProfile::Auto)
+        return settings.renderProfile == RenderProfile::Integrated;
+    return graphicsAdapter == GraphicsAdapter::Integrated || graphicsAdapter == GraphicsAdapter::Software;
+}
+
+const char* ProfileName(RenderProfile profile) {
+    switch (profile) {
+        case RenderProfile::Standard: return "standard";
+        case RenderProfile::Integrated: return "integrated";
+        default: return "auto";
+    }
+}
+
+void Log(const char* format, ...);
+bool SceneDepthEnabled();
+
+void LogRenderProfile() {
+    Log("RENDER_PROFILE configured=%s effective=%s adapter=%s mask_scale=%s layer_limit=%u scene_depth=%u",
+        ProfileName(settings.renderProfile), LimitGhostLayers() ? "integrated" : "standard",
+        GraphicsAdapterDetection::Name(graphicsAdapter), LimitGhostLayers() ? "half" : "full",
+        LimitGhostLayers() ? IntegratedGhostLayers : 0, unsigned(SceneDepthEnabled()));
 }
 
 unsigned PlayerScript(uintptr_t base, float& motionFrame);
@@ -647,8 +703,8 @@ void CopySceneDepth(Context* c, const SceneDepth& depth) {
 }
 
 bool SceneDepthEnabled() {
-    // Intel's compatibility path leaves the main depth texture with the game.
-    return settings.sceneDepthMode == 2 || (settings.sceneDepthMode == 0 && !intelAdapter);
+    if (intelAdapter && !intelDepthHook) return false;
+    return settings.sceneDepthMode == 2 || (settings.sceneDepthMode == 0 && !LimitGhostLayers());
 }
 
 void ObserveClearDepth(ClearDepth next, Context* c, ID3D11DepthStencilView* view, UINT flags, FLOAT value, UINT8 stencil) {
@@ -671,8 +727,10 @@ void ObserveClearDepth(ClearDepth next, Context* c, ID3D11DepthStencilView* view
 }
 
 void ResetContextState(ContextState& state) {
+    auto* device = state.device;
     auto readbacks = std::move(state.readbacks);
     state = ContextState{};
+    state.device = device;
     state.readbacks = std::move(readbacks);
 }
 
@@ -964,11 +1022,7 @@ void CapturePlayer(Context* c, const ContextState& state, ID3D11Device* device, 
             Log("CAMERA_BUFFER_COPY_END ok=%u", unsigned(copied));
         }
     }
-    const bool releasePoseAlive = res.chargeOrigin.count && renderFrame - res.chargeOrigin.frame < AnchorEndAge;
-    if (recording || (charge && chargeTimeline.current.visual != ChargeVisual::Off) ||
-        releasePoseAlive || effectFrame.leading || stomp || airCombo.armed)
-        res.playerFrontUntilUs = nowUs + 1000ull * std::max(650u, settings.lifetime);
-    if (effectFrame.body > 0 && nowUs < res.playerFrontUntilUs) {
+    if (res.captureFront) {
         if (res.playerFront.frame != renderFrame) res.playerFront.Begin(renderFrame, nowUs);
         CapturePart(c, state, device, res.playerFront, draw, key);
     }
@@ -1023,13 +1077,35 @@ void CapturePlayer(Context* c, const ContextState& state, ID3D11Device* device, 
 }
 
 void QueueFrame(DeviceResources& res, const PoseFrame& pose, ID3D11Buffer* color, float opacity, bool anchor = false) {
-    for (unsigned i = 0; i < pose.count; ++i) {
-        auto& packet = res.overlayDraws.emplace_back(pose.parts[i]);
-        packet.pose.constants[ViewProjectionSlot] = res.frameCamera;
-        packet.color = color;
-        packet.anchorOpacity = anchor ? opacity : 0;
-        packet.opacity = opacity;
-    }
+    // Present consumes the queue while holding renderMutex. Captured buffers stay with their poses.
+    res.overlayPoses.push_back({&pose, color, opacity, anchor});
+}
+
+unsigned BudgetOverlayPoses(std::vector<QueuedPose>& poses) {
+    std::stable_sort(poses.begin(), poses.end(), [](const QueuedPose& a, const QueuedPose& b) {
+        return a.anchor != b.anchor ? a.anchor : a.pose->frame < b.pose->frame;
+    });
+    if (!LimitGhostLayers() || poses.size() <= IntegratedGhostLayers) return 0;
+
+    // Keep the newest stationary imprint and the newest moving silhouette.
+    // A trail without an imprint keeps its oldest and newest silhouettes.
+    const auto firstMoving = std::partition_point(poses.begin(), poses.end(),
+        [](const QueuedPose& pose) { return pose.anchor; });
+    const auto older = firstMoving == poses.end() ? poses.end() - 2 :
+        firstMoving == poses.begin() ? poses.begin() : firstMoving - 1;
+    const auto skipped = static_cast<unsigned>(poses.size()) - IntegratedGhostLayers;
+    poses.front() = *older;
+    poses[1] = poses.back();
+    poses.resize(IntegratedGhostLayers);
+    return skipped;
+}
+
+float TrailStrength(const PoseFrame& pose, uint64_t nowUs) {
+    if (!pose.count || pose.frame >= renderFrame || pose.timeUs > nowUs) return 0;
+    const uint64_t age = pose.swallowClock ? renderFrame - swallow.pauseFrames - pose.swallowClock :
+        pose.fadeFrames ? renderFrame - pose.frame : nowUs - pose.timeUs;
+    const uint64_t duration = pose.fadeFrames ? pose.fadeFrames : 1000ull * settings.lifetime;
+    return age < duration ? float(duration - age) / float(duration) : 0;
 }
 
 void BuildOverlayDraws(DeviceResources& res, uint64_t nowUs) {
@@ -1063,7 +1139,6 @@ void BuildOverlayDraws(DeviceResources& res, uint64_t nowUs) {
     }
     if (airCombo.branch) return;
 
-    const uint64_t lifetimeUs = 1000ull * settings.lifetime;
     std::array<const PoseFrame*, PoseHistorySize> visible{};
     std::array<float, PoseHistorySize> strengths{};
     const auto& latest = res.trail[(res.nextTrail + PoseHistorySize - 1) % PoseHistorySize];
@@ -1072,12 +1147,9 @@ void BuildOverlayDraws(DeviceResources& res, uint64_t nowUs) {
     unsigned count = 0;
     for (unsigned i = 0; i < PoseHistorySize; ++i) {
         const auto& pose = res.trail[(res.nextTrail + i) % PoseHistorySize];
-        if (!pose.count || pose.frame >= renderFrame || pose.timeUs > nowUs) continue;
-        const uint64_t age = pose.swallowClock ? renderFrame - swallow.pauseFrames - pose.swallowClock :
-            pose.fadeFrames ? renderFrame - pose.frame : nowUs - pose.timeUs;
-        const uint64_t duration = pose.fadeFrames ? pose.fadeFrames : lifetimeUs;
-        if (age < duration) {
-            strengths[count] = float(duration - age) / float(duration);
+        const float strength = TrailStrength(pose, nowUs);
+        if (strength > 0) {
+            strengths[count] = strength;
             visible[count++] = &pose;
         }
     }
@@ -1107,8 +1179,8 @@ void ResetPoses() {
         res.chargeOrigin.Begin(0, 0);
         res.leadingPose.Begin(0, 0);
         res.playerFront.Begin(0, 0);
-        res.playerFrontUntilUs = 0;
-        res.overlayDraws.clear();
+        res.frontDecisionFrame = UINT64_MAX;
+        res.overlayPoses.clear();
     }
 }
 
@@ -1214,17 +1286,22 @@ void RememberSceneDepth(ID3D11Device* device, SceneDepth& depth, ID3D11DepthSten
     if (first) Log("SCENE_DEPTH_SETUP_READY size=%ux%u format=%u", desc.Width, desc.Height, unsigned(readFormat));
 }
 
-bool NeedsPoseFrame(const DeviceResources& res, uint64_t nowUs, bool recording, bool stomp) {
-    if (recording || stomp || effectFrame.leading || nowUs < res.playerFrontUntilUs ||
-        chargeTimeline.current.move != ChargeMove::None || airCombo.armed) return true;
+void UpdatePoseCapture(DeviceResources& res, uint64_t nowUs, bool recording, bool stomp) {
+    if (res.frontDecisionFrame == renderFrame) return;
+    res.frontDecisionFrame = renderFrame;
+    const bool charge = chargeTimeline.current.move != ChargeMove::None && chargeTimeline.current.visual != ChargeVisual::Off;
     const auto hasPose = [](const auto& poses, uint64_t lifetime) {
         return std::any_of(poses.begin(), poses.end(), [lifetime](const PoseFrame& pose) {
             return pose.count && renderFrame - pose.frame < lifetime;
         });
     };
-    return (res.chargeOrigin.count && renderFrame - res.chargeOrigin.frame < AnchorEndAge) ||
+    const bool previousPoses = (res.chargeOrigin.count && renderFrame - res.chargeOrigin.frame < AnchorEndAge) ||
         hasPose(res.stompOrigins, StompHoldFrames + StompFadeFrames) ||
-        hasPose(res.airOrigins, AirOriginFrames) || hasPose(res.airTrail, AirFadeFrames);
+        hasPose(res.airOrigins, AirOriginFrames) || hasPose(res.airTrail, AirFadeFrames) ||
+        std::any_of(res.trail.begin(), res.trail.end(),
+            [nowUs](const PoseFrame& pose) { return TrailStrength(pose, nowUs) > 0; });
+    res.capturePose = recording || stomp || effectFrame.leading || charge || airCombo.branch || previousPoses;
+    res.captureFront = res.capturePose && effectFrame.body > 0;
 }
 
 bool InspectDraw(Context* c, const Draw& draw) {
@@ -1249,7 +1326,6 @@ bool InspectDraw(Context* c, const Draw& draw) {
     const bool gear = activeCostume != Costume::Unknown &&
         std::find(DragonGearMeshes.begin(), DragonGearMeshes.end(), key) != DragonGearMeshes.end();
     if (!capture && !selected && !gear) return false;
-    const auto nowUs = PoseClockUs();
     const bool active = settings.enabled;
     if (active && (selected || gear)) UpdateAction();
     const float body = active && (selected || gear) ? effectFrame.body : 1;
@@ -1264,29 +1340,36 @@ bool InspectDraw(Context* c, const Draw& draw) {
     if (selected && sceneColor) ++activity.sceneColor;
     if ((!active || (!selected && !gear) || !sceneColor) && !capture && body >= 1) return false;
 
-    ComPtr<ID3D11Device> device;
-    c->GetDevice(device.GetAddressOf());
+    ComPtr<ID3D11Device> deviceRef;
+    if (!state.device) {
+        c->GetDevice(deviceRef.GetAddressOf());
+        state.device = deviceRef.Get();
+    }
+    auto* device = state.device;
     if (!device) return false;
-    auto& res = resources[device.Get()];
+    auto& res = resources[device];
     struct ExtraDrawScope {
         ExtraDrawScope() { drawingExtra = true; }
         ~ExtraDrawScope() { drawingExtra = false; }
     } extra;
-    if (capture && sceneColor) CaptureMask(c, state, device.Get(), res, draw, key);
-    if (!PrepareGhost(device.Get(), res)) return false;
+    if (capture && sceneColor) CaptureMask(c, state, device, res, draw, key);
     if (active && selected && sceneColor) {
         const bool recording = now < previewUntil || effectFrame.trailFrames || airCombo.descentCapture;
         const bool stomp = stompRenderFrame == renderFrame;
-        if (NeedsPoseFrame(res, nowUs, recording, stomp)) {
+        if (res.frontDecisionFrame != renderFrame) UpdatePoseCapture(res, PoseClockUs(), recording, stomp);
+        if (!res.capturePose && body >= 1) return false;
+        if (res.capturePose) {
+            if (!PrepareGhost(device, res)) return false;
             if (SceneDepthEnabled())
-                RememberSceneDepth(device.Get(), res.sceneDepth, state.depthView, state.depthState, state.viewport);
-            CapturePlayer(c, state, device.Get(), res, draw, key, nowUs, recording, stomp);
+                RememberSceneDepth(device, res.sceneDepth, state.depthView, state.depthState, state.viewport);
+            CapturePlayer(c, state, device, res, draw, key, PoseClockUs(), recording, stomp);
         }
     } else if (active && gear && sceneColor && body > 0 && res.playerFront.frame == renderFrame) {
-        CapturePart(c, state, device.Get(), res.playerFront, draw, key);
+        CapturePart(c, state, device, res.playerFront, draw, key);
     }
     if (body <= 0) return true;
     if (body >= 1) return false;
+    if (!PrepareGhost(device, res)) return false;
 
     // Every selected material uses the same opacity, including both eye draws.
     const FLOAT factors[]{body, body, body, body};
@@ -1380,7 +1463,7 @@ void ObserveExecute(ExecuteList next, Context* c, ID3D11CommandList* list, BOOL 
     }
 }
 
-bool PrepareOverlay(ID3D11Device* device, DeviceResources& res, const D3D11_TEXTURE2D_DESC& backBuffer) {
+bool PrepareOverlay(ID3D11Device* device, DeviceResources& res, const D3D11_TEXTURE2D_DESC& coverageSurface) {
     if (!res.overlayContext && FAILED(device->CreateDeferredContext(0, res.overlayContext.GetAddressOf()))) return false;
     if (!res.overlayRasterizer) {
         D3D11_RASTERIZER_DESC rasterizer{};
@@ -1399,10 +1482,10 @@ bool PrepareOverlay(ID3D11Device* device, DeviceResources& res, const D3D11_TEXT
         if (FAILED(device->CreateDepthStencilState(&coverage, res.overlayStencil.GetAddressOf()))) return false;
     }
     auto desc = MaskDescription();
-    desc.Width = backBuffer.Width;
-    desc.Height = backBuffer.Height;
+    desc.Width = coverageSurface.Width;
+    desc.Height = coverageSurface.Height;
     desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    desc.SampleDesc = backBuffer.SampleDesc;
+    desc.SampleDesc = coverageSurface.SampleDesc;
     desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     const auto& old = res.coverageDesc;
     if (res.overlayCoverage && desc.Width == old.Width && desc.Height == old.Height &&
@@ -1414,14 +1497,16 @@ bool PrepareOverlay(ID3D11Device* device, DeviceResources& res, const D3D11_TEXT
     return true;
 }
 
-bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D11_TEXTURE2D_DESC& backBuffer, unsigned layers) {
+bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D11_TEXTURE2D_DESC& backBuffer,
+    UINT maskWidth, UINT maskHeight, unsigned layers) {
     if (!res.fullscreen) {
         // Device object creation can fail partway through. Commit only when complete.
         RefractionResources prepared;
         if (!CreatePixelShader(device, AfterimageShaders::Composite, prepared.composite) ||
             !CreatePixelShader(device, AfterimageShaders::Part, prepared.partShader) ||
             !CreatePixelShader(device, AfterimageShaders::Glove, prepared.gloveShader) ||
-            !CreatePixelShader(device, AfterimageShaders::Grip, prepared.gripShader)) return false;
+            !CreatePixelShader(device, AfterimageShaders::Grip, prepared.gripShader) ||
+            !CreatePixelShader(device, AfterimageShaders::PlayerCoverage, prepared.playerCoverage)) return false;
         D3D11_BUFFER_DESC labels{};
         labels.ByteWidth = 16;
         labels.Usage = D3D11_USAGE_IMMUTABLE;
@@ -1461,7 +1546,8 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
     const bool sameSize = res.scene && res.surface.Width == backBuffer.Width &&
         res.surface.Height == backBuffer.Height && res.surface.Format == backBuffer.Format;
     const DXGI_FORMAT maskFormat = settings.glassVisual ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8G8_UNORM;
-    if (sameSize && res.maskFormat == maskFormat && res.slices.size() >= layers) return true;
+    const bool sameMask = res.maskWidth == maskWidth && res.maskHeight == maskHeight && res.maskFormat == maskFormat;
+    if (sameSize && sameMask && res.slices.size() >= layers) return true;
     auto desc = backBuffer;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -1471,21 +1557,25 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
     if (!sameSize && (FAILED(device->CreateTexture2D(&desc, nullptr, scene.GetAddressOf())) ||
         FAILED(device->CreateShaderResourceView(scene.Get(), nullptr, sceneView.GetAddressOf())))) return false;
     desc.Format = maskFormat;
-    desc.ArraySize = layers;
+    desc.Width = maskWidth;
+    desc.Height = maskHeight;
+    // Leave room for the normal five poses and the live player. Allocate once as the trail fills.
+    desc.ArraySize = sameMask && res.slices.size() >= layers ? static_cast<UINT>(res.slices.size()) :
+        std::max(layers, std::min(MaxGhostLayers + 1, settings.copies + 1));
     desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
     D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = desc.Format;
     srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
     srv.Texture2DArray.MipLevels = 1;
-    srv.Texture2DArray.ArraySize = layers;
+    srv.Texture2DArray.ArraySize = desc.ArraySize;
     if (FAILED(device->CreateTexture2D(&desc, nullptr, mask.GetAddressOf())) ||
         FAILED(device->CreateShaderResourceView(mask.Get(), &srv, maskView.GetAddressOf()))) return false;
-    std::vector<ComPtr<ID3D11RenderTargetView>> slices(layers);
+    std::vector<ComPtr<ID3D11RenderTargetView>> slices(desc.ArraySize);
     D3D11_RENDER_TARGET_VIEW_DESC rtv{};
     rtv.Format = desc.Format;
     rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
     rtv.Texture2DArray.ArraySize = 1;
-    for (unsigned i = 0; i < layers; ++i) {
+    for (UINT i = 0; i < desc.ArraySize; ++i) {
         rtv.Texture2DArray.FirstArraySlice = i;
         if (FAILED(device->CreateRenderTargetView(mask.Get(), &rtv, slices[i].GetAddressOf()))) return false;
     }
@@ -1497,6 +1587,8 @@ bool PrepareRefraction(ID3D11Device* device, RefractionResources& res, const D3D
     res.slices = std::move(slices);
     res.maskView = std::move(maskView);
     res.maskFormat = maskFormat;
+    res.maskWidth = maskWidth;
+    res.maskHeight = maskHeight;
     return true;
 }
 
@@ -1534,20 +1626,64 @@ void CompositeRefraction(Context* c, DeviceResources& res, ID3D11RenderTargetVie
     c->PSSetShaderResources(0, 2, empty);
 }
 
-void DrawOverlayPart(Context* c, const OverlayDraw& packet, ID3D11Buffer* camera) {
-    Original<SetLayout>(c, InputLayout)(c, packet.layout.Get());
-    Original<SetTopology>(c, Topology)(c, packet.topology);
-    Original<SetIndex>(c, IndexBuffer)(c, packet.index.Get(), packet.indexFormat, packet.indexOffset);
-    Original<SetVS>(c, VsShader)(c, packet.shader.Get(), nullptr, 0);
+struct OverlayBindings {
+    const OverlayDraw* previous = nullptr;
     std::array<ID3D11Buffer*, ConstantSlots> constants{};
     std::array<ID3D11Buffer*, VertexSlots> vertices{};
-    for (UINT i = 0; i < ConstantSlots; ++i) constants[i] = packet.pose.constants[i].Get();
-    if (camera) constants[ViewProjectionSlot] = camera;
-    for (UINT i = 0; i < VertexSlots; ++i) vertices[i] = packet.pose.vertices[i].Get();
-    Original<SetBuffers>(c, VsConstants)(c, 0, ConstantSlots, constants.data());
-    Original<SetVertex>(c, VertexBuffers)(c, 0, VertexSlots, vertices.data(), packet.strides.data(), packet.offsets.data());
-    CallDraw(c, packet.draw);
-}
+    std::array<UINT, VertexSlots> strides{}, offsets{};
+    unsigned changes = 0;
+
+    void DrawPart(Context* c, const OverlayDraw& packet, ID3D11Buffer* camera) {
+        if (!previous || previous->layout.Get() != packet.layout.Get()) {
+            Original<SetLayout>(c, InputLayout)(c, packet.layout.Get());
+            ++changes;
+        }
+        if (!previous || previous->topology != packet.topology) {
+            Original<SetTopology>(c, Topology)(c, packet.topology);
+            ++changes;
+        }
+        if (!previous || previous->index.Get() != packet.index.Get() || previous->indexFormat != packet.indexFormat ||
+            previous->indexOffset != packet.indexOffset) {
+            Original<SetIndex>(c, IndexBuffer)(c, packet.index.Get(), packet.indexFormat, packet.indexOffset);
+            ++changes;
+        }
+        if (!previous || previous->shader.Get() != packet.shader.Get()) {
+            Original<SetVS>(c, VsShader)(c, packet.shader.Get(), nullptr, 0);
+            ++changes;
+        }
+        UINT first = ConstantSlots, last = 0;
+        for (UINT i = 0; i < ConstantSlots; ++i) {
+            auto* value = i == ViewProjectionSlot && camera ? camera : packet.pose.constants[i].Get();
+            if (constants[i] != value) {
+                constants[i] = value;
+                first = std::min(first, i);
+                last = i + 1;
+            }
+        }
+        if (first < last) {
+            Original<SetBuffers>(c, VsConstants)(c, first, last - first, constants.data() + first);
+            ++changes;
+        }
+        first = VertexSlots;
+        last = 0;
+        for (UINT i = 0; i < VertexSlots; ++i) {
+            auto* value = packet.pose.vertices[i].Get();
+            if (vertices[i] == value && strides[i] == packet.strides[i] && offsets[i] == packet.offsets[i]) continue;
+            vertices[i] = value;
+            strides[i] = packet.strides[i];
+            offsets[i] = packet.offsets[i];
+            first = std::min(first, i);
+            last = i + 1;
+        }
+        if (first < last) {
+            Original<SetVertex>(c, VertexBuffers)(c, first, last - first, vertices.data() + first,
+                strides.data() + first, offsets.data() + first);
+            ++changes;
+        }
+        previous = &packet;
+        CallDraw(c, packet.draw);
+    }
+};
 
 
 void ReadOverlayCoverage(Context* immediate, OverlayCoverageProbe& probe) {
@@ -1556,51 +1692,57 @@ void ReadOverlayCoverage(Context* immediate, OverlayCoverageProbe& probe) {
     const auto mask = immediate->GetData(probe.geometry.Get(), &geometry, sizeof(geometry), D3D11_ASYNC_GETDATA_DONOTFLUSH);
     const auto output = immediate->GetData(probe.composite.Get(), &composite, sizeof(composite), D3D11_ASYNC_GETDATA_DONOTFLUSH);
     if (mask == S_FALSE || output == S_FALSE) return;
+    double gpuMs = -1;
+    if (probe.timed) {
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT timing{};
+        UINT64 start = 0, end = 0;
+        const auto frequency = immediate->GetData(probe.frequency.Get(), &timing, sizeof(timing), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        const auto begin = immediate->GetData(probe.start.Get(), &start, sizeof(start), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        const auto finish = immediate->GetData(probe.end.Get(), &end, sizeof(end), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (frequency == S_FALSE || begin == S_FALSE || finish == S_FALSE) return;
+        if (frequency == S_OK && begin == S_OK && finish == S_OK && !timing.Disjoint && timing.Frequency && end >= start)
+            gpuMs = 1000.0 * (end - start) / timing.Frequency;
+    }
     probe.pending = false;
     if (mask == S_OK && output == S_OK)
-        Log("OVERLAY_COVERAGE frame=%llu draws=%u depth=%u geometry=%llu composite=%llu",
+        Log("OVERLAY_COVERAGE frame=%llu draws=%u depth=%u geometry=%llu composite=%llu gpu_ms=%.3f",
             static_cast<unsigned long long>(probe.frame), probe.draws, unsigned(probe.sceneDepth),
-            static_cast<unsigned long long>(geometry), static_cast<unsigned long long>(composite));
+            static_cast<unsigned long long>(geometry), static_cast<unsigned long long>(composite), gpuMs);
     else
         Log("OVERLAY_COVERAGE_UNAVAILABLE mask=%08lx output=%08lx", mask, output);
 }
 
 bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& res) {
+    const auto cpuStart = PoseClockUs();
+    auto& poses = res.overlayPoses;
+    activity.skippedGhostLayers += BudgetOverlayPoses(poses);
+    const auto layerCount = static_cast<unsigned>(poses.size());
     ComPtr<ID3D11Texture2D> backBuffer;
     ComPtr<ID3D11RenderTargetView> target;
     if (FAILED(swap->GetBuffer(0, IID_PPV_ARGS(backBuffer.GetAddressOf()))) ||
         FAILED(device->CreateRenderTargetView(backBuffer.Get(), nullptr, target.GetAddressOf()))) return false;
     D3D11_TEXTURE2D_DESC desc{};
     backBuffer->GetDesc(&desc);
-    if (!PrepareOverlay(device, res, desc)) return false;
     ComPtr<Context> immediate;
     device->GetImmediateContext(immediate.GetAddressOf());
     if (!immediate) return false;
 
-    auto& draws = res.overlayDraws;
-    // Preserve the anchor under the moving trail and layer the newest pose last.
-    std::stable_sort(draws.begin(), draws.end(), [](const OverlayDraw& a, const OverlayDraw& b) {
-        const bool anchorA = a.anchorOpacity > 0;
-        const bool anchorB = b.anchorOpacity > 0;
-        return anchorA != anchorB ? anchorA : a.pose.renderFrame < b.pose.renderFrame;
-    });
-    const auto samePose = [](const OverlayDraw& a, const OverlayDraw& b) {
-        return a.pose.renderFrame == b.pose.renderFrame && (a.anchorOpacity > 0) == (b.anchorOpacity > 0);
-    };
-    unsigned layerCount = 1;
-    for (size_t i = 1; i < draws.size(); ++i)
-        if (!samePose(draws[i - 1], draws[i])) ++layerCount;
     struct OverlayScope {
         OverlayScope() { drawingExtra = true; }
         ~OverlayScope() { drawingExtra = false; }
     } extra;
-    auto* c = res.overlayContext.Get();
     auto& refraction = res.refraction;
     const auto& sceneDepth = res.sceneDepth;
     const bool hasSceneDepth = SceneDepthEnabled() && sceneDepth.frame == renderFrame && sceneDepth.view;
     const bool playerFront = res.playerFront.frame == renderFrame && res.playerFront.count;
     bool useRefraction = desc.SampleDesc.Count == 1 && !refraction.unavailable && layerCount <= MaxGhostLayers;
-    if (useRefraction && !PrepareRefraction(device, refraction, desc, layerCount + unsigned(playerFront))) {
+    auto coverageSurface = desc;
+    if (useRefraction && LimitGhostLayers()) {
+        coverageSurface.Width = (desc.Width + 1) / 2;
+        coverageSurface.Height = (desc.Height + 1) / 2;
+    }
+    if (useRefraction && !PrepareRefraction(device, refraction, desc, coverageSurface.Width,
+        coverageSurface.Height, layerCount + unsigned(playerFront))) {
         refraction = {};
         refraction.unavailable = true;
         useRefraction = false;
@@ -1608,31 +1750,9 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
     }
     // Keep a visible character untouched even if this backbuffer cannot build the front mask.
     if (playerFront && !useRefraction) return false;
-    if (hasSceneDepth && !sceneDepth.frozen) CopySceneDepth(c, sceneDepth);
-    auto* rtv = target.Get();
-    if (useRefraction) c->CopyResource(refraction.scene.Get(), backBuffer.Get());
-    auto* stencil = res.overlayCoverage.Get();
-    const D3D11_VIEWPORT viewport{0, 0, float(desc.Width), float(desc.Height),
-        hasSceneDepth ? sceneDepth.viewport.MinDepth : 0, hasSceneDepth ? sceneDepth.viewport.MaxDepth : 1};
-    if (!useRefraction) Original<SetTargets>(c, Targets)(c, 1, &rtv, stencil);
-    Original<SetDepth>(c, Depth)(c, useRefraction ? refraction.partDepth.Get() : res.overlayStencil.Get(), 0);
-    Original<SetViewport>(c, Viewports)(c, 1, &viewport);
-    Original<SetPS>(c, PsShader)(c, useRefraction ? refraction.partShader.Get() : res.ghostShader.Get(), nullptr, 0);
-    Original<SetBlend>(c, Blend)(c, useRefraction ? nullptr : res.ghostBlend.Get(), nullptr, UINT_MAX);
-    auto* lighting = res.ghostLighting.Get();
-    Original<SetBuffers>(c, PsConstants)(c, ColorSlot - 1, 1, &lighting);
-    const FLOAT depthParameters[]{float(sceneDepth.desc.Width) / desc.Width, float(sceneDepth.desc.Height) / desc.Height,
-        hasSceneDepth ? (sceneDepth.reversed ? -1.0f : 1.0f) : 0.0f, 0.00005f};
-    auto* depthConstants = res.sceneDepthConstants.Get();
-    c->UpdateSubresource(depthConstants, 0, nullptr, depthParameters, 0, 0);
-    Original<SetBuffers>(c, PsConstants)(c, ColorSlot - 3, 1, &depthConstants);
-    auto* depthTexture = hasSceneDepth ? sceneDepth.view.Get() : nullptr;
-    c->PSSetShaderResources(2, 1, &depthTexture);
-    if (useRefraction) {
-        const FLOAT projection[4]{1.0f / desc.Height};
-        c->UpdateSubresource(lighting, 0, nullptr, projection, 0, 0);
-    }
-    c->RSSetState(res.overlayRasterizer.Get());
+    if (!useRefraction) coverageSurface = desc;
+    if (!PrepareOverlay(device, res, coverageSurface)) return false;
+    auto* c = res.overlayContext.Get();
     auto& probe = res.coverageProbe;
     const bool probeThisFrame = useRefraction && !probe.pending && probe.samples < 6 &&
         (!probe.frame || renderFrame - probe.frame >= 45);
@@ -1643,90 +1763,140 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
             const D3D11_QUERY_DESC query{D3D11_QUERY_OCCLUSION, 0};
             if (FAILED(device->CreateQuery(&query, probe.geometry.ReleaseAndGetAddressOf())) ||
                 FAILED(device->CreateQuery(&query, probe.composite.ReleaseAndGetAddressOf()))) probe.samples = 6;
+            const D3D11_QUERY_DESC frequency{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+            const D3D11_QUERY_DESC stamp{D3D11_QUERY_TIMESTAMP, 0};
+            probe.timed = SUCCEEDED(device->CreateQuery(&frequency, probe.frequency.GetAddressOf())) &&
+                SUCCEEDED(device->CreateQuery(&stamp, probe.start.GetAddressOf())) &&
+                SUCCEEDED(device->CreateQuery(&stamp, probe.end.GetAddressOf()));
         }
     }
     const bool measure = probeThisFrame && probe.geometry && probe.composite;
+    if (measure && probe.timed) {
+        c->Begin(probe.frequency.Get());
+        c->End(probe.start.Get());
+    }
+    if (hasSceneDepth && !sceneDepth.frozen) CopySceneDepth(c, sceneDepth);
+    auto* rtv = target.Get();
+    if (useRefraction) c->CopyResource(refraction.scene.Get(), backBuffer.Get());
+    auto* stencil = res.overlayCoverage.Get();
+    const D3D11_VIEWPORT viewport{0, 0, float(coverageSurface.Width), float(coverageSurface.Height),
+        hasSceneDepth ? sceneDepth.viewport.MinDepth : 0, hasSceneDepth ? sceneDepth.viewport.MaxDepth : 1};
+    if (!useRefraction) Original<SetTargets>(c, Targets)(c, 1, &rtv, stencil);
+    Original<SetDepth>(c, Depth)(c, useRefraction ? refraction.partDepth.Get() : res.overlayStencil.Get(), 0);
+    Original<SetViewport>(c, Viewports)(c, 1, &viewport);
+    Original<SetPS>(c, PsShader)(c, useRefraction ? refraction.partShader.Get() : res.ghostShader.Get(), nullptr, 0);
+    Original<SetBlend>(c, Blend)(c, useRefraction ? nullptr : res.ghostBlend.Get(), nullptr, UINT_MAX);
+    auto* lighting = res.ghostLighting.Get();
+    Original<SetBuffers>(c, PsConstants)(c, ColorSlot - 1, 1, &lighting);
+    const FLOAT depthParameters[]{float(sceneDepth.desc.Width) / coverageSurface.Width, float(sceneDepth.desc.Height) / coverageSurface.Height,
+        hasSceneDepth ? (sceneDepth.reversed ? -1.0f : 1.0f) : 0.0f, 0.00005f};
+    auto* depthConstants = res.sceneDepthConstants.Get();
+    c->UpdateSubresource(depthConstants, 0, nullptr, depthParameters, 0, 0);
+    Original<SetBuffers>(c, PsConstants)(c, ColorSlot - 3, 1, &depthConstants);
+    auto* depthTexture = hasSceneDepth ? sceneDepth.view.Get() : nullptr;
+    c->PSSetShaderResources(2, 1, &depthTexture);
+    if (useRefraction) {
+        const FLOAT projection[4]{1.0f / coverageSurface.Height};
+        c->UpdateSubresource(lighting, 0, nullptr, projection, 0, 0);
+    }
+    c->RSSetState(res.overlayRasterizer.Get());
     if (measure) c->Begin(probe.geometry.Get());
-    const OverlayDraw* previous = nullptr;
     std::array<float, MaxGhostLayers> opacities{};
     float lastOpacity = -1;
+    ID3D11Buffer* lastColor = nullptr;
     unsigned lastPartLabel = UINT_MAX;
     auto* partShader = refraction.partShader.Get();
-    unsigned poses = 0;
-    for (const auto& packet : draws) {
-        if (!previous || !samePose(*previous, packet)) {
-            if (useRefraction) {
-                // The nearest surface determines the anatomical label within this pose.
-                auto* layer = refraction.slices[poses].Get();
-                const FLOAT clear[4]{};
-                c->ClearRenderTargetView(layer, clear);
-                c->ClearDepthStencilView(stencil, D3D11_CLEAR_DEPTH, 1, 0);
-                Original<SetTargets>(c, Targets)(c, 1, &layer, stencil);
-                opacities[poses] = packet.opacity;
-            } else {
-                c->ClearDepthStencilView(stencil, D3D11_CLEAR_STENCIL, 1, 0);
-            }
-            ++poses;
+    unsigned layerIndex = 0, ghostDraws = 0;
+    OverlayBindings bindings;
+    for (const auto& queued : poses) {
+        if (useRefraction) {
+            // The nearest surface determines the anatomical label within this pose.
+            auto* layer = refraction.slices[layerIndex].Get();
+            const FLOAT clear[4]{};
+            c->ClearRenderTargetView(layer, clear);
+            c->ClearDepthStencilView(stencil, D3D11_CLEAR_DEPTH, 1, 0);
+            Original<SetTargets>(c, Targets)(c, 1, &layer, stencil);
+            opacities[layerIndex] = queued.opacity;
+        } else {
+            c->ClearDepthStencilView(stencil, D3D11_CLEAR_STENCIL, 1, 0);
         }
-        previous = &packet;
-        const bool mixed = packet.material == GhostMaterial::Glove || packet.material == GhostMaterial::GripAtlas;
-        const auto material = mixed ? GhostMaterial::Armor : packet.material;
-        const unsigned labelIndex = unsigned(material) * 8 + unsigned(packet.bodyPart) - 1;
-        auto* nextShader = packet.material == GhostMaterial::GripAtlas ? refraction.gripShader.Get() :
-            packet.material == GhostMaterial::Glove ? refraction.gloveShader.Get() : refraction.partShader.Get();
-        if (useRefraction && nextShader != partShader) {
-            Original<SetPS>(c, PsShader)(c, nextShader, nullptr, 0);
-            partShader = nextShader;
-        }
-        if (useRefraction && labelIndex != lastPartLabel) {
-            auto* label = refraction.partLabels[labelIndex].Get();
-            Original<SetBuffers>(c, PsConstants)(c, ColorSlot - 2, 1, &label);
-            lastPartLabel = labelIndex;
-        }
-        if (!useRefraction && packet.opacity != lastOpacity) {
+        ++layerIndex;
+        if (!useRefraction && queued.opacity != lastOpacity) {
             const float glow = settings.glowStrength / 100.0f;
-            const FLOAT constants[4]{packet.opacity,
+            const FLOAT constants[4]{queued.opacity,
                 settings.glassVisual ? settings.brightness / 100.0f + glow : 1.0f + glow};
             c->UpdateSubresource(lighting, 0, nullptr, constants, 0, 0);
-            lastOpacity = packet.opacity;
+            lastOpacity = queued.opacity;
         }
-        if (!useRefraction) {
-            auto* color = packet.color.Get();
+        if (!useRefraction && lastColor != queued.color) {
+            auto* color = lastColor = queued.color;
             Original<SetBuffers>(c, PsConstants)(c, ColorSlot, 1, &color);
         }
-        DrawOverlayPart(c, packet, nullptr);
+        for (unsigned i = 0; i < queued.pose->count; ++i) {
+            const auto& packet = queued.pose->parts[i];
+            if (useRefraction) {
+                const bool mixed = packet.material == GhostMaterial::Glove || packet.material == GhostMaterial::GripAtlas;
+                const auto material = mixed ? GhostMaterial::Armor : packet.material;
+                const unsigned labelIndex = unsigned(material) * 8 + unsigned(packet.bodyPart) - 1;
+                auto* nextShader = packet.material == GhostMaterial::GripAtlas ? refraction.gripShader.Get() :
+                    packet.material == GhostMaterial::Glove ? refraction.gloveShader.Get() : refraction.partShader.Get();
+                if (nextShader != partShader) {
+                    Original<SetPS>(c, PsShader)(c, nextShader, nullptr, 0);
+                    partShader = nextShader;
+                }
+                if (labelIndex != lastPartLabel) {
+                    auto* label = refraction.partLabels[labelIndex].Get();
+                    Original<SetBuffers>(c, PsConstants)(c, ColorSlot - 2, 1, &label);
+                    lastPartLabel = labelIndex;
+                }
+            }
+            bindings.DrawPart(c, packet, res.frameCamera.Get());
+        }
+        ghostDraws += queued.pose->count;
     }
     if (measure) c->End(probe.geometry.Get());
     if (playerFront) {
-        if (partShader != refraction.partShader.Get())
-            Original<SetPS>(c, PsShader)(c, refraction.partShader.Get(), nullptr, 0);
-        auto* layer = refraction.slices[poses].Get();
+        Original<SetPS>(c, PsShader)(c, refraction.playerCoverage.Get(), nullptr, 0);
+        auto* layer = refraction.slices[layerCount].Get();
         const FLOAT clear[4]{};
         c->ClearRenderTargetView(layer, clear);
         c->ClearDepthStencilView(stencil, D3D11_CLEAR_DEPTH, 1, 0);
         Original<SetTargets>(c, Targets)(c, 1, &layer, stencil);
-        auto* label = refraction.partLabels[0].Get();
-        Original<SetBuffers>(c, PsConstants)(c, ColorSlot - 2, 1, &label);
         for (unsigned i = 0; i < res.playerFront.count; ++i)
-            DrawOverlayPart(c, res.playerFront.parts[i], res.frameCamera.Get());
+            bindings.DrawPart(c, res.playerFront.parts[i], res.frameCamera.Get());
     }
     if (measure) c->Begin(probe.composite.Get());
-    if (useRefraction) CompositeRefraction(c, res, target.Get(), poses, opacities, playerFront);
+    if (useRefraction) {
+        const D3D11_VIEWPORT output{0, 0, float(desc.Width), float(desc.Height), 0, 1};
+        Original<SetViewport>(c, Viewports)(c, 1, &output);
+        CompositeRefraction(c, res, target.Get(), layerCount, opacities, playerFront);
+    }
     if (measure) c->End(probe.composite.Get());
+    if (measure && probe.timed) {
+        c->End(probe.end.Get());
+        c->End(probe.frequency.Get());
+    }
     ComPtr<ID3D11CommandList> list;
     if (FAILED(Original<FinishList>(c, Finish)(c, FALSE, list.GetAddressOf())) || !list) return false;
     Original<ExecuteList>(immediate.Get(), Execute)(immediate.Get(), list.Get(), TRUE);
+    const auto cpuUs = static_cast<unsigned long long>(PoseClockUs() - cpuStart);
+    ++activity.overlayFrames;
+    activity.overlayCpuUs += cpuUs;
+    activity.peakOverlayCpuUs = std::max(activity.peakOverlayCpuUs, cpuUs);
+    activity.peakGhostDraws = std::max<unsigned long long>(activity.peakGhostDraws, ghostDraws);
+    const unsigned frontDraws = playerFront ? res.playerFront.count : 0;
+    activity.peakFrontDraws = std::max<unsigned long long>(activity.peakFrontDraws, frontDraws);
     if (measure) {
-        probe.draws = static_cast<unsigned>(draws.size());
+        probe.draws = ghostDraws;
         probe.sceneDepth = hasSceneDepth;
         probe.pending = true;
     }
     if (loggedOverlays++ < 16)
-        Log("OVERLAY_DRAW frame=%llu draws=%u poses=%u backbuffer=%ux%u brightness=%u emission=%u refraction=%u segmented=%u player_front=%u style=%s scene_depth=%ux%u frozen=%u",
-            static_cast<unsigned long long>(renderFrame), static_cast<unsigned>(draws.size()), poses, desc.Width,
-            desc.Height, settings.brightness, settings.glowStrength,
+        Log("OVERLAY_DRAW frame=%llu draws=%u poses=%u backbuffer=%ux%u mask=%ux%u state_binds=%u brightness=%u emission=%u refraction=%u segmented=%u player_front=%u style=%s scene_depth=%ux%u frozen=%u",
+            static_cast<unsigned long long>(renderFrame), ghostDraws, layerCount, desc.Width,
+            desc.Height, coverageSurface.Width, coverageSurface.Height, bindings.changes, settings.brightness, settings.glowStrength,
             useRefraction ? (settings.glassVisual ? settings.glassRefraction : settings.refractionPixels) : 0,
-            unsigned(useRefraction), playerFront ? res.playerFront.count : 0,
+            unsigned(useRefraction), frontDraws,
             settings.glassVisual ? "Sigma2" : "Classic", hasSceneDepth ? sceneDepth.desc.Width : 0,
             hasSceneDepth ? sceneDepth.desc.Height : 0, hasSceneDepth && sceneDepth.frozen);
     return true;
@@ -1735,8 +1905,15 @@ bool RenderOverlay(IDXGISwapChain* swap, ID3D11Device* device, DeviceResources& 
 HRESULT ObservePresent(Present next, IDXGISwapChain* swap, UINT syncInterval, UINT flags) {
     // A windowed swap chain can keep presenting after another window gains focus.
     if (hooksReady && swap == gameSwap && !(flags & DXGI_PRESENT_TEST)) {
+        const auto nowUs = PoseClockUs();
         std::lock_guard<std::recursive_mutex> guard(renderMutex);
         ++activity.presented;
+        if (lastPresentUs) {
+            auto& cadence = lastPresentHadOverlay ? activity.cadenceWithOverlay : activity.cadenceWithoutOverlay;
+            cadence.Record(nowUs - lastPresentUs);
+        }
+        lastPresentUs = nowUs;
+        lastPresentHadOverlay = false;
         for (auto& entry : resources) {
             auto& res = entry.second;
             try {
@@ -1745,14 +1922,14 @@ HRESULT ObservePresent(Present next, IDXGISwapChain* swap, UINT syncInterval, UI
                     entry.first->GetImmediateContext(immediate.GetAddressOf());
                     if (immediate) ReadOverlayCoverage(immediate.Get(), res.coverageProbe);
                 }
-                if (settings.enabled) BuildOverlayDraws(res, PoseClockUs());
-                if (res.overlayDraws.empty()) continue;
-                if (settings.enabled && !RenderOverlay(swap, entry.first, res) && loggedOverlays++ < 16)
-                    Log("OVERLAY_DRAW_FAILED");
+                if (settings.enabled) BuildOverlayDraws(res, nowUs);
+                if (res.overlayPoses.empty()) continue;
+                if (RenderOverlay(swap, entry.first, res)) lastPresentHadOverlay = true;
+                else if (loggedOverlays++ < 16) Log("OVERLAY_DRAW_FAILED");
             } catch (...) {
                 Log("OVERLAY_DRAW_FAILED exception");
             }
-            res.overlayDraws.clear();
+            res.overlayPoses.clear();
         }
         ++renderFrame;
     }
@@ -1768,6 +1945,7 @@ struct ContextHook {
 std::array<RenderVtable::Slot, MaxContextTables * ContextHookCount> contextEntries{};
 std::array<std::atomic<bool>, MaxContextTables * ContextHookCount> retiredContextEntries{};
 std::array<std::atomic<void*>, MaxContextTables * ContextHookCount> contextOriginals{};
+std::array<std::array<void*, 2>, MaxContextTables * ContextHookCount> verifiedContextTargets{};
 std::array<RenderVtable::Slot, 1> presentEntries{};
 std::array<RenderVtable::Slot, 1> deviceEntries{};
 std::array<void**, MaxContextTables> contextTables{};
@@ -1833,20 +2011,25 @@ const AfterimageDrawHandlers sharedDrawHandlers{
     }
 };
 
-bool RebindContextSlot(const RenderVtable::Slot& entry) {
+bool RebindContextSlot(const RenderVtable::Slot& entry, std::array<void*, 2>* verified = nullptr) {
     if (!entry.address || entry.retired->load()) return false;
     void* current = *entry.address;
-    if (current == entry.observer) return false;
+    if (!current || current == entry.observer) return false;
     const auto previous = entry.Next();
-    if (current != previous) {
+    if (current != previous && (!verified || std::find(verified->begin(), verified->end(), current) == verified->end())) {
+        ++activity.rebindChecks;
         MEMORY_BASIC_INFORMATION oldCode{}, newCode{};
         if (!VirtualQuery(entry.original, &oldCode, sizeof(oldCode)) ||
             !VirtualQuery(current, &newCode, sizeof(newCode)) || newCode.Type != MEM_IMAGE ||
             oldCode.AllocationBase != newCode.AllocationBase ||
             !(newCode.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
             return false;
-        entry.currentOriginal->store(current);
+        if (verified) {
+            (*verified)[1] = (*verified)[0];
+            (*verified)[0] = current;
+        }
     }
+    if (current != previous) entry.currentOriginal->store(current);
     if (entry.Exchange(current, entry.observer)) return true;
     entry.currentOriginal->store(previous);
     return false;
@@ -1859,7 +2042,12 @@ bool AttachContext(Context* context, const char* source) {
     if (known != contextTables.end()) {
         const size_t row = known - contextTables.begin();
         for (size_t i = 0; i < ContextHookCount; ++i) {
-            if (RebindContextSlot(contextEntries[row * ContextHookCount + i])) ++activity.rebound;
+            const auto position = row * ContextHookCount + i;
+            const auto& entry = contextEntries[position];
+            if (RebindContextSlot(entry, &verifiedContextTargets[position])) {
+                ++activity.rebound;
+                activity.fastRebind += entry.writable;
+            }
         }
         return true;
     }
@@ -1871,16 +2059,20 @@ bool AttachContext(Context* context, const char* source) {
         const auto& hook = contextHooks[i];
         void** address = table + hook.index;
         // Automatic Intel mode never intercepts the clear implicated by the crash.
-        if (intelAdapter && settings.sceneDepthMode != 2 && hook.index == ClearDepthView) continue;
+        if (intelAdapter && !intelDepthHook && hook.index == ClearDepthView) continue;
         if (controllerHooks.original && controllerHooks.original(table, hook.index)) {
             if (hook.index == Indexed || hook.index == IndexedInstanced || hook.index == Execute)
                 sharedRenderSlots.insert(address);
             continue;
         }
         const size_t position = row * ContextHookCount + i;
+        verifiedContextTargets[position] = {};
         auto& entry = contextEntries[position];
+        MEMORY_BASIC_INFORMATION page{};
+        const bool writableTable = VirtualQuery(address, &page, sizeof(page)) &&
+            page.Type == MEM_PRIVATE && page.Protect == PAGE_READWRITE;
         entry = {address, *address, hook.handlers[row], hook.index, Log, &retiredContextEntries[position],
-            &contextOriginals[position]};
+            &contextOriginals[position], writableTable};
         entry.retired->store(false);
         entry.currentOriginal->store(entry.original);
         originals.emplace(address, &entry);
@@ -1910,10 +2102,11 @@ bool ObservePrepareGameDraw(void* renderer, int topology) {
     // The game applies its dirty pipeline state here, immediately before submitting a draw.
     if (hooksReady) {
         auto* context = *reinterpret_cast<Context* const*>(static_cast<const BYTE*>(renderer) + GameContextOffset);
-        std::lock_guard<std::recursive_mutex> guard(renderMutex);
-        ++activity.prepared;
-        AttachContext(context, "game-draw");
-        return originalPrepareGameDraw(renderer, topology);
+        {
+            std::lock_guard<std::recursive_mutex> guard(renderMutex);
+            ++activity.prepared;
+            AttachContext(context, "game-draw");
+        }
     }
     return originalPrepareGameDraw(renderer, topology);
 }
@@ -1936,12 +2129,19 @@ bool BindRenderHooks(ID3D11Device* device, Context* immediate, IDXGISwapChain* s
     if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(dxgi.GetAddressOf()))) &&
         SUCCEEDED(dxgi->GetAdapter(adapter.GetAddressOf())) && SUCCEEDED(adapter->GetDesc(&adapterDesc))) {
         intelAdapter = adapterDesc.VendorId == 0x8086;
-        Log("RENDER_ADAPTER vendor=%04x device=%04x revision=%u feature_level=%x scene_depth=%u",
+        intelDepthHook = intelAdapter && settings.sceneDepthMode == 2;
+        graphicsAdapter = GraphicsAdapterDetection::QueryDxCore(adapterDesc.AdapterLuid);
+        const bool dxcore = graphicsAdapter != GraphicsAdapter::Unknown;
+        if (!dxcore) graphicsAdapter = GraphicsAdapterDetection::ClassifyLegacy(adapterDesc.VendorId,
+            adapterDesc.DedicatedVideoMemory, adapterDesc.SharedSystemMemory);
+        Log("RENDER_ADAPTER vendor=%04x device=%04x revision=%u feature_level=%x class=%s detection=%s dedicated_mib=%llu name=%ls",
             adapterDesc.VendorId, adapterDesc.DeviceId, adapterDesc.Revision,
-            unsigned(device->GetFeatureLevel()), unsigned(SceneDepthEnabled()));
+            unsigned(device->GetFeatureLevel()), GraphicsAdapterDetection::Name(graphicsAdapter), dxcore ? "DXCore" : "DXGI",
+            static_cast<unsigned long long>(adapterDesc.DedicatedVideoMemory / (1024 * 1024)), adapterDesc.Description);
     } else {
         Log("RENDER_ADAPTER_UNKNOWN");
     }
+    LogRenderProfile();
     auto* present = RenderVtable::Table(swap) + 8;
     presentEntries[0] = {present, *present,
         reinterpret_cast<void*>(RenderVtable::Observer<Present, ObservePresent>::Call<presentEntries, 0>), 8, Log};
@@ -2043,35 +2243,37 @@ unsigned ReadNumber(const wchar_t* name, unsigned fallback, unsigned low, unsign
 }
 
 void ReadSettings() {
-    std::lock_guard<std::recursive_mutex> guard(renderMutex);
-    const bool previouslyEnabled = settings.enabled;
-    const bool previousMaterial = settings.glassVisual;
-    const Appearance previous{settings.alpha, settings.glowStrength, settings.tint, settings.muscleHighlight,
-        settings.brightness};
+    Settings updated;
+    std::array<Appearance, std::size(Costumes)> loaded;
     wchar_t material[24]{};
     GetPrivateProfileStringW(L"Afterimage", L"Material", L"Classic", material, std::size(material), ini.c_str());
-    settings.glassVisual = _wcsicmp(material, L"Sigma2") == 0;
-    settings.enabled = ReadNumber(L"Enabled", 1, 0, 1) != 0;
-    settings.autoET = ReadNumber(L"AutomaticDragonET", 1, 0, 1) != 0;
-    settings.autoUT = ReadNumber(L"AutomaticDragonUT", 1, 0, 1) != 0;
-    settings.autoWindRun = ReadNumber(L"AutomaticWindRun", 1, 0, 1) != 0;
-    settings.autoWallDownslash = ReadNumber(L"AutomaticWallDownslash", 1, 0, 1) != 0;
-    settings.autoSwallow = ReadNumber(L"AutomaticFlyingSwallow", 1, 0, 1) != 0;
-    settings.autoWhiteFeather = ReadNumber(L"AutomaticWhiteFeather", 1, 0, 1) != 0;
-    const auto previousDepthMode = settings.sceneDepthMode;
-    settings.sceneDepthMode = ReadNumber(L"SceneDepthMode", 0, 0, 2);
-    if (previousDepthMode != settings.sceneDepthMode)
-        Log("SCENE_DEPTH_MODE config=%u enabled=%u", settings.sceneDepthMode, unsigned(SceneDepthEnabled()));
-    settings.interval = ReadNumber(L"IntervalMs", 12, 6, 150);
-    settings.lifetime = ReadNumber(L"LifetimeMs", 185, 65, 650);
-    settings.copies = ReadNumber(L"Copies", 5, 1, 5);
-    settings.previewMs = ReadNumber(L"PreviewMs", 8000, 500, 10000);
-    settings.revealFrames = ReadNumber(L"RevealFrames", 9, 1, 45);
-    settings.utRevealFrames = ReadNumber(L"UTRevealFrames", 12, 1, 45);
-    settings.refractionPixels = ReadNumber(L"RefractionPixels", 1, 0, 8);
-    settings.glassRefraction = ReadNumber(L"GlassRefractionPixels", 19, 0, 36);
-    settings.jointOpacity = ReadNumber(L"JointOpacityPercent", 76, 0, 100);
-    for (unsigned i = 0; i < appearances.size(); ++i) {
+    updated.glassVisual = _wcsicmp(material, L"Sigma2") == 0;
+    updated.enabled = ReadNumber(L"Enabled", 1, 0, 1) != 0;
+    updated.autoET = ReadNumber(L"AutomaticDragonET", 1, 0, 1) != 0;
+    updated.autoUT = ReadNumber(L"AutomaticDragonUT", 1, 0, 1) != 0;
+    updated.autoWindRun = ReadNumber(L"AutomaticWindRun", 1, 0, 1) != 0;
+    updated.autoWallDownslash = ReadNumber(L"AutomaticWallDownslash", 1, 0, 1) != 0;
+    updated.autoSwallow = ReadNumber(L"AutomaticFlyingSwallow", 1, 0, 1) != 0;
+    updated.autoWhiteFeather = ReadNumber(L"AutomaticWhiteFeather", 1, 0, 1) != 0;
+    updated.sceneDepthMode = ReadNumber(L"SceneDepthMode", 0, 0, 2);
+    wchar_t profile[24]{};
+    GetPrivateProfileStringW(L"Afterimage", L"RenderProfile", L"", profile, std::size(profile), ini.c_str());
+    if (_wcsicmp(profile, L"Standard") == 0) updated.renderProfile = RenderProfile::Standard;
+    else if (_wcsicmp(profile, L"Integrated") == 0) updated.renderProfile = RenderProfile::Integrated;
+    else if (!profile[0]) {
+        const auto legacy = ReadNumber(L"LayerBudgetMode", 0, 0, 2);
+        if (legacy) updated.renderProfile = legacy == 1 ? RenderProfile::Integrated : RenderProfile::Standard;
+    }
+    updated.interval = ReadNumber(L"IntervalMs", 12, 6, 150);
+    updated.lifetime = ReadNumber(L"LifetimeMs", 185, 65, 650);
+    updated.copies = ReadNumber(L"Copies", 5, 1, 5);
+    updated.previewMs = ReadNumber(L"PreviewMs", 8000, 500, 10000);
+    updated.revealFrames = ReadNumber(L"RevealFrames", 9, 1, 45);
+    updated.utRevealFrames = ReadNumber(L"UTRevealFrames", 12, 1, 45);
+    updated.refractionPixels = ReadNumber(L"RefractionPixels", 1, 0, 8);
+    updated.glassRefraction = ReadNumber(L"GlassRefractionPixels", 19, 0, 36);
+    updated.jointOpacity = ReadNumber(L"JointOpacityPercent", 76, 0, 100);
+    for (unsigned i = 0; i < loaded.size(); ++i) {
         const auto costume = static_cast<Costume>(i);
         const bool exposedSkin = costume == Costume::Black || costume == Costume::Blue || costume == Costume::Grip;
         auto load = [&](const wchar_t* section) -> Appearance {
@@ -2085,15 +2287,25 @@ void ReadSettings() {
                 exposedSkin ? read(L"MuscleHighlightPercent", 45, 100) : 0,
                 read(L"SurfaceBrightnessPercent", 100, MaxSurfaceBrightness)};
         };
-        if (settings.glassVisual) {
+        if (updated.glassVisual) {
             const auto section = std::wstring(L"Afterimage.Sigma2") + wcschr(Costumes[i].section, L'.');
-            appearances[i] = load(section.c_str());
+            loaded[i] = load(section.c_str());
         } else {
-            appearances[i] = load(Costumes[i].section);
+            loaded[i] = load(Costumes[i].section);
         }
     }
+    const unsigned serial = GetPrivateProfileIntW(L"Diagnostics", L"Capture", 0, ini.c_str());
+    std::lock_guard<std::recursive_mutex> guard(renderMutex);
+    const auto previousSettings = settings;
+    const Appearance previous{settings.alpha, settings.glowStrength, settings.tint, settings.muscleHighlight,
+        settings.brightness};
+    settings = updated;
+    appearances = loaded;
     ApplyAppearance();
-    if (previousMaterial != settings.glassVisual)
+    if (previousSettings.sceneDepthMode != settings.sceneDepthMode)
+        Log("SCENE_DEPTH_MODE config=%u enabled=%u", settings.sceneDepthMode, unsigned(SceneDepthEnabled()));
+    if (previousSettings.renderProfile != settings.renderProfile) LogRenderProfile();
+    if (previousSettings.glassVisual != settings.glassVisual)
         Log("MATERIAL_RELOAD %s", settings.glassVisual ? "Sigma2" : "Classic");
     if (activeCostume != Costume::Unknown && (previous.alpha != settings.alpha ||
         previous.glow != settings.glowStrength || previous.tint != settings.tint ||
@@ -2102,7 +2314,7 @@ void ReadSettings() {
             unsigned(activeCostume), settings.alpha, settings.glowStrength, settings.tint[0], settings.tint[1],
             settings.tint[2], settings.muscleHighlight, settings.brightness);
     }
-    if (previouslyEnabled != settings.enabled) {
+    if (previousSettings.enabled != settings.enabled) {
         ResetPoses();
         chargeTimeline = {};
         airCombo = {};
@@ -2113,7 +2325,6 @@ void ReadSettings() {
         windRunBranch = 0;
         Log("CONFIG enabled=%u", unsigned(settings.enabled));
     }
-    const unsigned serial = GetPrivateProfileIntW(L"Diagnostics", L"Capture", 0, ini.c_str());
     if (serial && serial != captureSerial) {
         captureSerial = serial;
         captureKeys.clear();
@@ -2181,9 +2392,19 @@ DWORD WINAPI PollAfterimage(void*) {
             lastRenderReport = now;
             std::lock_guard<std::recursive_mutex> guard(renderMutex);
             if (hooksReady && settings.enabled) {
-                Log("RENDER_ACTIVITY present=%llu indexed=%llu state_ready=%llu costume=%llu scene_color=%llu viewport=%.0fx%.0f prepared=%llu rebound=%llu",
+                Log("RENDER_ACTIVITY present=%llu indexed=%llu state_ready=%llu costume=%llu scene_color=%llu viewport=%.0fx%.0f prepared=%llu rebound=%llu fast_rebind=%llu rebind_checks=%llu",
                     activity.presented, activity.indexed, activity.stateReady, activity.costume, activity.sceneColor,
-                    activity.viewport.Width, activity.viewport.Height, activity.prepared, activity.rebound);
+                    activity.viewport.Width, activity.viewport.Height, activity.prepared, activity.rebound, activity.fastRebind,
+                    activity.rebindChecks);
+                const auto& with = activity.cadenceWithOverlay;
+                const auto& without = activity.cadenceWithoutOverlay;
+                Log("FRAME_PACING with_overlay=%llu over_18ms=%llu over_25ms=%llu peak_us=%llu without_overlay=%llu over_18ms=%llu over_25ms=%llu peak_us=%llu",
+                    with.frames, with.over18Ms, with.over25Ms, with.peakUs,
+                    without.frames, without.over18Ms, without.over25Ms, without.peakUs);
+                if (activity.overlayFrames)
+                    Log("OVERLAY_CPU frames=%llu average_us=%llu peak_us=%llu peak_ghost_draws=%llu peak_front_draws=%llu skipped_layers=%llu",
+                        activity.overlayFrames, activity.overlayCpuUs / activity.overlayFrames, activity.peakOverlayCpuUs,
+                        activity.peakGhostDraws, activity.peakFrontDraws, activity.skippedGhostLayers);
                 activity = {};
             }
         }
@@ -2198,7 +2419,7 @@ bool StartAfterimage(const wchar_t* root, GameCompatibility::Kind kind, Controll
     logFile = _wfsopen((directory + L"\\NGS1Afterimage.log").c_str(), L"wb", _SH_DENYNO);
     gameBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     controllerHooks = shared;
-    Log("GAME pid=%lu build=%s afterimage=0.6.19 shader_bytecode=embedded", GetCurrentProcessId(), GameCompatibility::Name(kind));
+    Log("GAME pid=%lu build=%s afterimage=0.6.22 shader_bytecode=embedded", GetCurrentProcessId(), GameCompatibility::Name(kind));
     if (GetModuleHandleW(L"NGS1Afterimage.dll")) {
         Log("LEGACY_AFTERIMAGE_ALREADY_LOADED");
         return false;

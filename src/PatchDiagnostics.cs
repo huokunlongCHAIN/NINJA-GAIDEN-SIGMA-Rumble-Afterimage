@@ -207,6 +207,9 @@ internal static class PatchDiagnostics {
     report.AppendLine("Created UTC: "+DateTime.UtcNow.ToString("o"));
     report.AppendLine("Installer: "+Payload.Version+"; bundled core: "+Payload.Core);
     report.AppendLine("Windows: "+Environment.OSVersion.Version+"; 64-bit OS: "+Environment.Is64BitOperatingSystem);
+    var hardware=HardwareInfo.Detect();
+    report.AppendLine("CPU: "+(hardware.Cpu??""));
+    report.AppendLine("Graphics adapters: "+String.Join(" / ",hardware.Gpus));
     foreach(var scope in (root==null?new[]{(string)null}:new[]{(string)null,root})){
      string name=LogName(scope),label=scope==null?"installer-general.log":"installer-game.log";
      AddLog(zip,label,PatchEngine.Child(LogFolder,name),root,report);
@@ -223,6 +226,7 @@ internal static class PatchDiagnostics {
       report.AppendLine("Compatibility: "+exe.Reason+" ["+exe.Family+"]");
       report.AppendLine("Installer status: "+info.Description);
       report.AppendLine("Enabled: rumble="+info.Rumble+", DualSense="+info.DualSense+", afterimages="+info.Afterimage);
+      report.AppendLine("Afterimage render profile: "+info.RenderProfile);
       if(File.Exists(game)){
        report.AppendLine("EXE file version: "+FileVersionInfo.GetVersionInfo(game).FileVersion);
        report.AppendLine("EXE SHA-256: "+RuntimeBridge.Hash(game));
