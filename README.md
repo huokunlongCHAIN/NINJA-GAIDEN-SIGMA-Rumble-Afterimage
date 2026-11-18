@@ -37,7 +37,7 @@ pwsh -File .\package.ps1
 
 [Code signing policy and current application status](docs/CODE-SIGNING.md) · [Privacy policy](docs/PRIVACY.md)
 
-正在准备向 SignPath Foundation 申请免费开源签名，尚未获批，当前文件仍未签名。自动构建用于公开验证源码和产物，不会自动请求签名或发布正式版本。
+已于 2026-11-18 提交 SignPath Foundation 免费开源签名申请，正在等待审核，当前文件仍未签名。自动构建用于公开验证源码和产物，不会自动请求签名或发布正式版本。
 
 默认构建包括 DualSense 输入、震动与内置 PS／Xbox 图标切换。图标在运行时绘制。需要自定义样式时，可以用自己有权使用的原版与 PS 图标 GT1G 容器生成本地头文件，然后用 `build.ps1 -IconHeader <路径>` 构建。两套容器的文件名为 `02771.GT1G0600` 和 `02777.GT1G0600`。
 

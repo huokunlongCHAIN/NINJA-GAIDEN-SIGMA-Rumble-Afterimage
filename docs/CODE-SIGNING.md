@@ -2,7 +2,8 @@
 
 ## Status
 
-An application to the SignPath Foundation is being prepared. No subscription,
+An application to the SignPath Foundation was submitted on 2026-11-18; the
+application page displayed "Form submitted". Approval is pending. No subscription,
 certificate, signed release, or approval is claimed. Current test packages are
 unsigned. A valid signature would identify the publisher and protect file
 integrity; it would not guarantee antivirus or Nexus approval.
