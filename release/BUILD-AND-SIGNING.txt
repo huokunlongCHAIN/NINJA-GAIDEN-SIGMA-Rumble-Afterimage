@@ -1,0 +1,36 @@
+Reconstructing/building 0.6.27 Native Plugin Test
+
+1. Clone the public repository and check out:
+   3ff3e5542f2279726291fb2e2c7138c3d02424a7 (v0.6.25)
+2. Apply the included SOURCE-CHANGES.patch:
+   git apply --check SOURCE-CHANGES.patch
+   git apply SOURCE-CHANGES.patch
+3. Use Windows, .NET Framework 4.x C# compiler, and x64 LLVM/MinGW:
+   .\build.ps1 -ClangDirectory "<LLVM-MinGW-bin>" -RunRenderTests
+   .\package.ps1
+
+The build produces the DLL, optional crash helper, UI and tests. It does not
+compile or distribute NGS1RumbleAuto.exe. No payload binaries are embedded.
+The package script includes newly added source files after they are added to
+the local Git index. Adding to the index does not publish files.
+
+Run package preflight without installing:
+  NGS1RumblePatch.exe --verify-package "<result.json>"
+
+Owned trusted certificate signing is optional and not performed in this test:
+  .\build.ps1 -ClangDirectory "<LLVM-MinGW-bin>" -RunRenderTests `
+    -SigningCertificateThumbprint "<owned-cert-thumbprint>" `
+    -SignToolPath "<Windows-SDK-signtool.exe>"
+  .\package.ps1
+Components are signed before their hashes are compiled into the UI. The UI is
+signed last, and SignTool verifies the signatures. A trusted signature proves
+publisher identity/integrity; it does not promise antivirus or Nexus approval.
+
+Tests
+- Native rendering/material/occlusion/charge/icon tests via -RunRenderTests.
+- tools/test_plugin_startup.cpp verifies lazy initialization and forwarding.
+- tests/PluginInstallerTests.cs checks compiled installer API boundaries,
+  independent features, absence of autostart creation and complete restore.
+- tests/TransparentPackageTests.cs checks missing/tampered files and migration
+  of rules/settings from previous releases using supplied known EXE fixtures.
+See TEST-RESULTS.txt for the actual executed scope.

@@ -1,31 +1,46 @@
-Ninja Gaiden Sigma Enhancements 0.6.25
+Ninja Gaiden Sigma Enhancements 0.6.27 - Native Plugin TEST
 
-The Ninja Gaiden 2-style material uses the blue-white highlights and soft transitions from the 0.6.24 test build. You can update in place from the 0.6.22 release or the 0.6.23 and 0.6.24 test builds. Your selected material and outfit settings are retained.
+The game now loads dinput8.dll through its normal DirectInput import. The core
+starts on the first input API call, outside DllMain. This build contains no
+remote-process injection code, resident autoloader, or startup registration.
+It retains rumble, DualSense input/icons, and all afterimage materials/settings.
+It remains unsigned. No antivirus clearance or Nexus approval is claimed.
 
-The Afterimages tab shows the detected CPU and graphics adapters. The default Auto profile uses the adapter actually rendering the game. Discrete GPUs use Standard with full-resolution masks and the full trail. Integrated GPUs use Integrated Graphics with half-resolution masks and up to two afterimages per frame. All three materials support both profiles. Choose either profile manually and select Apply Profile to switch during play. The setting is saved for the selected game folder.
-Diagnostics record the active game adapter, effective profile, and frame submission intervals with and without afterimages.
+Installation
+1. Exit the game and extract the entire ZIP. Keep Payload beside the installer.
+2. Run NGS1RumblePatch.exe outside the game's runtime folder and select the EXE.
+3. Install/update Rumble, DualSense, and Afterimages separately as desired.
+4. Open the game EXE normally or use the separate Launch Game button.
+   Installation does not start the game. No resident patch program is needed.
 
-Both profiles use the current renderer compatibility fixes. Integrated Graphics skips automatic scene depth sampling. Intel GPUs also keep the protective depth-clear bypass by default in Standard. This can affect wall occlusion.
+Upgrade and restore
+Tested upgrades from 0.6.25/0.6.26 preserve saved rumble rules and outfit settings.
+The legacy compatibility runtime is migrated to the game directory and its
+owned autoloader/Run entry/runtime folder are removed after successful install.
+Features can be restored independently. Restore All restores the game-directory
+files backed up by this installation and removes owned patch logs/backups.
+It does not reinstall the old resident loader. Use a retained old package if
+you deliberately want the previous loading design again.
+Foreign dinput8.dll files and unknown runtime files are preserved and block
+conflicting operations. Game EXEs, archives, saves and other mods are not patched.
 
-Choose English or 简体中文 in the upper-right corner of the installer. Changes apply immediately, and the installer remembers your selection.
-In windowed mode, rumble and afterimages follow gameplay when the pointer leaves the game window or another window gains focus.
+Compatibility limits
+Known 1.0.0.2/1.0.0.4 executable fingerprint checks are retained.
+This round smoke-tested the known 1.0.0.2 EXE and the current imjinjia-localized
+1.0.0.4 EXE. Direct EXE reopening also loaded the plugin. The independent original
+1.0.0.4 build was not available as a full installation for a fresh startup test.
+Do not describe this test as universally verified. See TEST-RESULTS.txt.
 
-Installation and restore
-1. Exit the game. Extract the package, run NGS1RumblePatch.exe, and select NINJA GAIDEN SIGMA.exe.
-2. Install or update Rumble, DualSense, or Afterimages. You can restore each feature separately. Existing 0.6.x installations can be updated in place.
-3. Open the game EXE normally or use Launch Game. In compatibility mode, the per-user autoloader takes a few seconds to load the installed features.
-4. Restore All removes the patch runtime and its startup entry. Your game files and saves remain in place.
+Features
+All three afterimage materials and five costume presets remain, including
+glow/color/opacity/muscle controls and the existing 200% controls. Auto/Standard/
+Integrated GPU profiles, hot reload and all rumble/action timing rules remain.
+DualSense USB input/rumble and PS/Xbox icon switching are retained. Bluetooth
+has not been physically verified.
 
-Installation errors and game crashes
-Reopen the installer, select the affected game EXE, and click Export Diagnostics. Review the ZIP before sharing it with the steps to reproduce the problem. It includes recent installer errors, game version and hashes, available loader and runtime logs, and Windows crash summaries for the selected game. Export replaces the game and Windows user directories with placeholders.
-After a crash, choose Trace Game Crash to relaunch, reproduce the crash, and capture module addresses and available stack frames. Export Diagnostics includes the trace. For missing afterimages, export after trying the affected moves. The log records captured costume draws and sampled GPU coverage.
-
-Afterimages
-Choose Classic-style Material, Sigma 2-style Material, or Ninja Gaiden 2-style Material, then choose a costume. Each costume has separate glow strength, color, and transparency settings for each material. All three support 200% glow strength. The Sigma 2- and Ninja Gaiden 2-style materials also support 200% surface brightness. This doubles the corresponding contribution at 100%. Foreground geometry occludes afterimages when scene depth is available. Legendary Black Falcon, Legendary Ninja (Blue), and Grip of Murder also offer a muscle highlight control with a default of 45%.
-Save and Apply Material applies the selected material to all costumes and reloads changes in a running game. Each costume uses its own saved settings. Ctrl+F11 previews the effect and Ctrl+F12 stops the preview.
-
-Supported builds
-The installer verifies known 1.0.0.2 and 1.0.0.4 executables, including the tested 1.0.0.4 Chinese localization by imjinjia. A matching version number alone does not establish compatibility. If verification fails, check the selected EXE and any patches that modify it.
-
-Controller support
-The DualSense feature includes automatic button icons. Use a DualSense to see the PlayStation face and shoulder button symbols. Switching back to Xbox restores its original icons. The patch draws the PlayStation symbols at runtime. DualSense input and rumble were verified over USB. Bluetooth has not been physically tested.
+Diagnostics and review
+Export Diagnostics collects the selected game's existing patch/crash logs.
+Trace Game Crash explicitly runs the visible, verified NGS1CrashTrace.exe helper.
+See SECURITY-REVIEW.txt for behaviors, BUILD-AND-SIGNING.txt for reconstruction,
+PACKAGE-MANIFEST.json/SHA256SUMS.txt for inventory, and SOURCE-CHANGES.patch.
+Checksums establish consistency, not trusted publisher identity or malware clearance.

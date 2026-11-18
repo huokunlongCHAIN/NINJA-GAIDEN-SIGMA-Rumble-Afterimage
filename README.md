@@ -6,7 +6,7 @@
 
 ## 安装与调整
 
-退出游戏，打开 `NGS1RumblePatch.exe`，选择游戏 EXE 并安装所需功能。兼容模式会为当前 Windows 用户安装自动加载器。安装后可直接打开游戏 EXE。
+当前分支是 0.6.27 纯插件测试版。退出游戏并完整解压安装包，保留 `Payload` 文件夹，打开 `NGS1RumblePatch.exe` 选择游戏 EXE。由游戏直接加载插件，不再注册常驻自动加载器。安装器未签名，未宣称通过杀毒或 Nexus 审核。
 
 右上角可即时切换简体中文和 English，安装器会记住上次选择。安装包附有中英文使用说明。
 
@@ -48,10 +48,17 @@ This Windows mod adds configurable afterimages for five Ryu costumes, controller
 
 Download the ZIP from Releases, exit the game, and run `NGS1RumblePatch.exe`. Choose **English** in the upper-right corner. Select the game EXE and install the features you want. You can then start the game normally.
 
-The public package supports verified 1.0.0.2 and 1.0.0.4 builds, including the tested 1.0.0.4 Chinese localization. Installing DualSense support also enables automatic PlayStation/Xbox button icons. The source build commands above use PowerShell 7 and x64 LLVM with MinGW.
+This branch is the unsigned 0.6.27 native-plugin test. Known 1.0.0.2/1.0.0.4 recognition profiles remain, but this round runtime-tested the known 1.0.0.2 EXE and the current Chinese-localized 1.0.0.4 EXE. The independent original 1.0.0.4 full installation was not available for a fresh launch test. The game loads the plugin normally, with no resident injector or new startup entry. Installing DualSense also enables automatic PlayStation/Xbox icons. Build with PowerShell 7 and x64 LLVM/MinGW.
 
 The Afterimages tab offers Classic-style, Sigma 2-style, and Ninja Gaiden 2-style materials, with separate glow strength, color, and transparency settings for all five costumes. All three support 200% glow strength. The Sigma 2- and Ninja Gaiden 2-style materials also support 200% surface brightness. Walls occlude afterimages where scene depth is available. Integrated Graphics mode and Intel adapters skip scene depth copies by default, which can affect wall occlusion. After updating the runtime, **Save and Apply Material** reloads the appearance in a running game.
 
 The installer lists the CPU and graphics adapters. By default, Auto selects a render profile based on the adapter used by the game. Discrete GPUs draw the full trail with full-resolution masks. Integrated GPUs draw up to two poses with half-resolution masks. Choose **Standard** or **Integrated Graphics** and click **Apply Profile** to override the setting during play.
 
 After an installation error or game crash, select the affected game EXE and choose **Export Diagnostics**. The ZIP contains recent installer and runtime logs and a summary of Windows crash events for the selected game. For repeatable crashes, start the game using **Trace Game Crash** to include available stack frames and module addresses in the ZIP.
+## Native plugin loading test
+
+The game imports the DLL and starts its worker on the first input API call, outside DllMain.
+The installer reads five verified external components and has no executable payload resources.
+External-process injection and autostart creation are removed. Legacy cleanup can only stop
+and remove owned old entries. Runtime features and optional diagnostics remain.
+See `release/SECURITY-REVIEW.txt` and `release/TEST-RESULTS.txt` for behavior and verification limits.

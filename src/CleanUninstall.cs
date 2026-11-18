@@ -90,7 +90,7 @@ public static class CleanUninstall {
     if(entry.Directory)valid=BackupName.IsMatch(parts[0])||parts[0]=="NGS1Rumble";
     else if(parts[0]=="launch-state.json")valid=true;
     else if(parts[0]=="NGS1RumblePatch.exe")valid=entry.Hash.Equals(launcherHash,StringComparison.OrdinalIgnoreCase)||entry.Hash==Payload.FileHash(System.Reflection.Assembly.GetExecutingAssembly().Location);
-    else if(parts[0]==AutoLifecycle.FileName)valid=entry.Hash==autoHash||entry.Hash==previousAutoHash||entry.Hash==PayloadHashes.Values[AutoLifecycle.FileName];
+    else if(parts[0]==AutoLifecycle.FileName)valid=entry.Hash==autoHash||entry.Hash==previousAutoHash;
     else if(Payload.Names.Contains(parts[0]))valid=parts[0]!="dinput8.dll"||Payload.KnownCores.Contains(entry.Hash);
    }else if(BackupName.IsMatch(parts[0]))valid=BackupEntry(entry,entry.Relative.Substring(parts[0].Length+1));
    else if(parts[0]=="NGS1Rumble")valid=parts.Length==2&&!entry.Directory&&LogName.IsMatch(parts[1]);

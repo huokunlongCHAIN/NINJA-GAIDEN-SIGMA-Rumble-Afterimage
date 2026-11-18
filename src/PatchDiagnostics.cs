@@ -54,9 +54,7 @@ internal static class PatchDiagnostics {
     "同一目录有多个游戏进程，请先退出多余的实例。","Close extra game instances in this folder first."));
    Directory.CreateDirectory(LogFolder);
    string trace=PatchEngine.Child(LogFolder,TraceName(root));
-   string helper=PatchEngine.Child(LogFolder,".trace-"+Guid.NewGuid().ToString("N")+".exe");
-   try{
-    File.WriteAllBytes(helper,Payload.LoadExtra("NGS1CrashTrace.exe").Bytes);
+   string helper=Payload.VerifiedExtraPath("NGS1CrashTrace.exe");
     int pid=running.Length==1?running[0].Id:new FeatureFacade().Launch(root);
     using(var process=Process.Start(new ProcessStartInfo{
      FileName=helper,Arguments=pid.ToString(CultureInfo.InvariantCulture)+" \""+trace+"\"",
@@ -67,11 +65,6 @@ internal static class PatchDiagnostics {
      if(process.ExitCode!=0)throw new InvalidOperationException(InstallerLanguage.T(
       "无法记录崩溃调用栈，诊断包会包含错误信息。","Could not capture crash frames. Export diagnostics for the error details."));
     }
-   }finally{
-    try{File.Delete(helper);}
-    catch(IOException error){Failure("trace-helper-cleanup",root,error);}
-    catch(UnauthorizedAccessException error){Failure("trace-helper-cleanup",root,error);}
-   }
   }finally{foreach(var game in running)game.Dispose();}
  }
 
