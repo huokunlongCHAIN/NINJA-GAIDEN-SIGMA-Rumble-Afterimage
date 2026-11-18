@@ -1,0 +1,55 @@
+name: Windows native plugin build
+
+on:
+  push:
+    branches: [main, codex/signpath-application]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up LLVM and MinGW
+        id: msys2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        with:
+          msystem: CLANG64
+          update: true
+          cache: false
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-libc++
+      - name: Build from source and run render and timing checks
+        shell: pwsh
+        env:
+          NGS1_MSYS_ROOT: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $compilerBin = Join-Path $env:NGS1_MSYS_ROOT 'clang64\bin'
+          $env:PATH = $compilerBin + ';' + $env:PATH
+          & $compilerBin\clang++.exe --version
+          ./build.ps1 -ClangDirectory $compilerBin -RunRenderTests
+      - name: Verify metadata and package integrity
+        shell: pwsh
+        run: ./tools/verify_release.ps1
+      - name: Package unsigned test build
+        shell: pwsh
+        run: ./package.ps1
+      - name: Upload unsigned source-built test artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ngs1-native-plugin-unsigned-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            dist/NGS1_NativePlugin_0.6.27_Test/
+            build/ci-verification.json

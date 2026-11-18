@@ -91,7 +91,7 @@ public static class FeatureIni {
 }
 public sealed class FeatureFacade {
  readonly PatchFacade core=new PatchFacade();
- static string DataRoot(string root){return LaunchEngine.HasState(root)?PatchEngine.Child(root,LaunchEngine.Folder):root;}
+ static string DataRoot(string root){return LaunchEngine.ConfigRoot(root);}
  sealed class FeatureLock:IDisposable {
   readonly Mutex mutex;
   public FeatureLock(string root){
@@ -163,10 +163,11 @@ public sealed class FeatureFacade {
   AutoLifecycle.RequireGameStopped(root);var current=Inspect(root);
   bool nextRumble=rumble??current.Rumble,nextDS=ds??current.DualSense,nextAfterimage=afterimage??current.Afterimage;
   if(!nextRumble&&!nextDS&&!nextAfterimage)return core.Restore(root);
+  Payload.ValidateAll();
   GameCompatibility.Validate(Path.Combine(root,Payload.ExeName));if(!current.CanInstall)throw new Exception(current.Description);
   if(nextAfterimage&&!current.CanInstallAfterimage)throw new Exception(InstallerLanguage.T("此游戏构建的渲染入口尚未验证。请确认未安装其他会修改游戏程序的补丁。", "The rendering entry point for this game build has not been verified. Check whether another patch modified the executable."));
   var selected=SelectPayload(root,nextRumble,nextDS,nextAfterimage,profile);var compatibility=GameCompatibility.Inspect(Path.Combine(root,Payload.ExeName));
-  string message=compatibility.Family=="original-code"?LaunchEngine.Install(root,true,selected):new PatchEngine(null,selected).Install(root);
+  string message=LaunchEngine.Install(root,selected);
   return String.Format(InstallerLanguage.T(
    "震动 {0} · PS5 手柄 {1} · 残影 {2}。\r\n可直接打开游戏 EXE，或点击“启动游戏”。\r\n{3}",
    "Rumble {0} · DualSense {1} · Afterimages {2}.\r\nOpen the game EXE or click Launch Game.\r\n{3}"),
@@ -227,7 +228,7 @@ public sealed class FeatureFacade {
  }
  public int Launch(string input){
   string root=PatchEngine.Root(input);var current=Inspect(root);bool patched=current.Rumble||current.DualSense||current.Afterimage;
-  if(patched){GameCompatibility.Validate(Path.Combine(root,Payload.ExeName));LaunchEngine.StartInstalledWatcher(root);}
+  if(patched){GameCompatibility.Validate(Path.Combine(root,Payload.ExeName));LaunchEngine.RequirePlugin(root);}
   var running=RuntimeBridge.Games(root);try{if(running.Length>0)return running[0].Id;}finally{foreach(var game in running)game.Dispose();}
   using(var process=System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo{FileName=Path.Combine(root,Payload.ExeName),WorkingDirectory=root,UseShellExecute=true}))return process.Id;
  }

@@ -25,6 +25,10 @@ static class Program {
   string operation=args[0],root=args.Length>=2?args[1]:null;
   var json=new JavaScriptSerializer();
   try{
+   if(operation=="--verify-package"&&args.Length==2){
+    Payload.ValidateAll();
+    File.WriteAllText(args[1],json.Serialize(new{ok=true,version=Payload.Version,distribution="native-plugin-test",components=PayloadHashes.Values}),new UTF8Encoding(false));return 0;
+   }
    if(operation=="--export-diagnostics"&&args.Length==3){PatchDiagnostics.Export(root,args[2]);return 0;}
    if(operation=="--trace-game"&&args.Length==3){
     string message=PatchDiagnostics.Run(operation,root,()=>PatchDiagnostics.Trace(root));
@@ -54,6 +58,7 @@ static class Program {
    File.WriteAllText(args[2],result,new UTF8Encoding(false));return 0;
   }catch(Exception error){
    PatchDiagnostics.Failure(operation,root,error);
+   if(operation=="--verify-package"&&args.Length==2){File.WriteAllText(args[1],json.Serialize(new{ok=false,message=error.Message}),new UTF8Encoding(false));return 1;}
    if(operation=="--export-diagnostics")return 1;
    if(args.Length==3)File.WriteAllText(args[2],json.Serialize(new{ok=false,started=false,message=error.Message}),new UTF8Encoding(false));
    else MessageBox.Show(error.Message,InstallerLanguage.T("西格玛1 功能补丁","Ninja Gaiden Sigma Enhancements"));
@@ -99,7 +104,7 @@ sealed class FeatureForm:Form {
  Color tint;
  bool translating;
  public FeatureForm(string initial=null){
-  Bind(this,"西格玛1 · 功能补丁 "+Payload.Version,"Ninja Gaiden Sigma Enhancements "+Payload.Version);
+  Bind(this,"西格玛1 · 纯插件测试版 "+Payload.Version,"Ninja Gaiden Sigma Plugin Test "+Payload.Version);
   ClientSize=new Size(880,800);MinimumSize=new Size(810,680);StartPosition=FormStartPosition.CenterScreen;Font=new Font("Microsoft YaHei UI",10);BackColor=Color.FromArgb(23,29,38);ForeColor=Color.White;
   var installerIcon=InstallerIcon.Create();
   Icon=installerIcon;
@@ -114,7 +119,7 @@ sealed class FeatureForm:Form {
   heading.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));
   heading.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,125));
   heading.Controls.Add(Bind(new Label{Font=new Font(Font.FontFamily,19,FontStyle.Bold),Dock=DockStyle.Fill},
-   "西格玛1 · 功能补丁","Ninja Gaiden Sigma Enhancements"),0,0);
+   "西格玛1 · 纯插件测试版","Ninja Gaiden Sigma · Plugin Test"),0,0);
   language.Name="InstallerLanguage";
   language.AccessibleName="语言 / Language";
   language.DropDownStyle=ComboBoxStyle.DropDownList;

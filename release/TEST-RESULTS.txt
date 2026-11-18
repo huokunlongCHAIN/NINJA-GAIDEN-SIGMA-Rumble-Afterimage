@@ -1,0 +1,30 @@
+0.6.27 Native Plugin Test - verification scope, 18 November 2026
+
+Passed:
+- Original 1.0.0.2 EXE isolated startup with the game loading the plugin.
+- Closed that game, directly reopened its EXE, and verified the installed DLL,
+  rumble/input hooks, DualSense USB route and PS icon mode loaded again.
+- Current imjinjia-localized 1.0.0.4 EXE direct startup in an isolated copy.
+- User confirmed menu/input, combat/charge rumble and wind-run afterimages.
+- 0.6.25 and 0.6.26 migrations preserve feature flags, material/outfit settings
+  and customized rumble rules; legacy runtime/Run entry are removed.
+- Independent feature restore, complete owned-file cleanup and EXE preservation.
+- Missing/tampered package components fail before installation writes.
+- Compiled UI contains no external-process allocation/write/remote-thread APIs,
+  resident autoloader class, injection entry point or Run-entry creation method.
+- Native initialization waits until the first input API, runs once, and forwards
+  repeated DirectInput creation successfully. No worker starts in DllMain.
+- Existing material, charge timing, controller glyph, rendering and occlusion tests.
+
+Smoke-test executable SHA256 values:
+1.0.0.2:
+A40242446574F4E56C5C560FBB09875C2DBF71D2C084195A0ED9B93BC405A338
+Current localized 1.0.0.4:
+5D52F7BA7AD725F99613E24C4F571526FB603C7CBFB4346AFF53F40EA0470472
+
+The isolated startup copies used assets/dependencies from the user's available
+installation. These are not a replacement for testing every clean Steam build.
+The independent original/aligned 1.0.0.4 full installation was unavailable for
+fresh runtime verification. Its existing strict recognition profiles remain.
+Bluetooth and fresh physical Intel-GPU runs were not performed in this round.
+This file records functionality tests, not antivirus clearance or Nexus approval.

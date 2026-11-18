@@ -1,0 +1,45 @@
+0.6.27 Native Plugin Test / 纯插件测试版
+
+Removed / 已移除
+- RuntimeBridge/Launcher external process allocation, writes and remote threads.
+- NGS1RumbleAuto.exe compilation and distribution.
+- Registry startup creation and resident game-watching loader.
+- Temporary installer copies, self-deletion, encoded PowerShell cleanup.
+- Core worker startup inside DllMain.
+
+Retained / 保留
+- The game normally imports the adjacent dinput8.dll. Its DirectInput API
+  forwards to Windows' System32 dinput8.dll and initializes the mod once.
+- The core reads its own process and hooks selected game/render/input functions
+  in that same process. It checks known file layouts and live function bytes.
+- The installer copies verified files, stores backups, manages independent
+  feature flags and visual settings, launches the game only on request, and
+  can stop/remove only an owned legacy loader registration during migration.
+- Registry reads/deletions for that legacy cleanup remain; no new Run value
+  is created. No service, task or new startup mechanism replaces the loader.
+- Optional crash tracing uses Windows debugging APIs in a visible separate
+  helper. It runs only when the user requests Trace Game Crash.
+- Hardware detection uses WMI/DXCore. Selected debugging hotkeys are polled.
+
+Boundaries / 边界
+This package is unsigned and is a test release, with no claim of zero detections,
+security-vendor certification or Nexus approval. Legitimate in-process hooks and
+the optional debugger can still be flagged. No scanner exclusions, security
+disabling, obfuscator, or self-signed trust-root installation is used.
+0.6.27 genuinely removes the old injector capabilities instead of concealing them.
+
+The package includes only five external components: the core DLL, three INI
+configuration/rule files, and the optional crash helper. No game files or saves
+are distributed. The installer has zero executable payload resources.
+
+Source / 源码
+Public baseline: v0.6.25, commit 3ff3e5542f2279726291fb2e2c7138c3d02424a7
+https://github.com/huokunlongCHAIN/NINJA-GAIDEN-SIGMA-Rumble-Afterimage/tree/v0.6.25
+Apply the included SOURCE-CHANGES.patch to reconstruct this test's source.
+The changed initialization is in native/rumble.cpp. Installer/legacy migration
+logic is in src/Launcher.cs, src/RuntimeBridge.cs and src/AutoLifecycle.cs.
+
+Signing / 签名
+An owned, trusted code-signing certificate/service is needed for a verified
+publisher identity. Product metadata/application manifests are not signatures.
+Code signing does not guarantee antivirus clearance or immediate SmartScreen reputation.

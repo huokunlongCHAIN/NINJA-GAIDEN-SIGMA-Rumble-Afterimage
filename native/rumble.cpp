@@ -46,6 +46,23 @@ static std::atomic<bool> stopRequested{false};
 static std::atomic<DWORD> nativePacked[4];
 static ULONGLONG startTick;
 static INIT_ONCE proxyOnce = INIT_ONCE_STATIC_INIT;
+static INIT_ONCE coreOnce = INIT_ONCE_STATIC_INIT;
+static HANDLE coreStartupReady;
+static DWORD WINAPI Worker(void*);
+static void SignalCoreStartup() { if(coreStartupReady)SetEvent(coreStartupReady); }
+static BOOL CALLBACK BeginCore(PINIT_ONCE, PVOID, PVOID*) {
+    coreStartupReady=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    if(!coreStartupReady)return FALSE;
+    HANDLE thread=CreateThread(nullptr,0,Worker,nullptr,0,nullptr);
+    if(!thread){CloseHandle(coreStartupReady);coreStartupReady=nullptr;return FALSE;}
+    CloseHandle(thread);return TRUE;
+}
+static void StartFromInputCall() {
+    // This API call occurs outside DllMain. Finish input hooks before the game
+    // starts enumerating devices, without starting a worker under loader lock.
+    if(InitOnceExecuteOnce(&coreOnce,BeginCore,nullptr,nullptr)&&coreStartupReady)
+        WaitForSingleObject(coreStartupReady,5000);
+}
 typedef DWORD (WINAPI* GetStateFn)(DWORD, XINPUT_STATE*);
 typedef DWORD (WINAPI* SetStateFn)(DWORD, XINPUT_VIBRATION*);
 typedef DWORD (WINAPI* CapabilitiesFn)(DWORD,DWORD,XINPUT_CAPABILITIES*);
@@ -546,6 +563,7 @@ static FARPROC DinputProc(const char* name) {
 }
 
 extern "C" HRESULT WINAPI ProxyDirectInput8Create(HINSTANCE instance, DWORD version, REFIID iid, LPVOID* out, LPUNKNOWN outer) {
+    StartFromInputCall();
     auto fn = reinterpret_cast<HRESULT(WINAPI*)(HINSTANCE,DWORD,REFIID,LPVOID*,LPUNKNOWN)>(DinputProc("DirectInput8Create"));
     return fn ? fn(instance, version, iid, out, outer) : E_FAIL;
 }
@@ -607,6 +625,7 @@ static bool GameForeground() {
 }
 
 static DWORD WINAPI Worker(void*) {
+    struct StartupSignal { ~StartupSignal(){SignalCoreStartup();} } startupSignal;
     HMODULE pinned;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                       reinterpret_cast<LPCWSTR>(Worker), &pinned);
@@ -619,7 +638,7 @@ static DWORD WINAPI Worker(void*) {
                time.wYear,time.wMonth,time.wDay,time.wHour,time.wMinute,time.wSecond,GetCurrentProcessId());
     swprintf_s(iniPath, L"%s\\NGS1Rumble.ini", root);
     logFile = _wfsopen(logPath, L"wb", _SH_DENYNO); if (!logFile) return 0;
-    Print("NGS1 Modular Controller Core 0.7.5 pid=%lu", GetCurrentProcessId());
+    Print("NGS1 Modular Controller Core 0.7.6 load_mode=native-plugin pid=%lu", GetCurrentProcessId());
     wchar_t executable[MAX_PATH]; GetModuleFileNameW(nullptr, executable, MAX_PATH);
     char hash[65]{}; bool hashOk = HashFile(executable, hash);
     Print("exe_sha256=%s", hashOk ? hash : "READ_ERROR");
@@ -735,6 +754,7 @@ static DWORD WINAPI Worker(void*) {
     Print("iat_get=%u iat_set=%u base=%llx", getHook, setHook, static_cast<unsigned long long>(gameBase));
     Print("READY F5=reload_rules F6=test_left_then_right F7=marker F9=STOP; experimental_event_rules=%u",ruleCount);
     MonitorOpen();
+    SignalCoreStartup();
     bool previousF5=false,previousF6=false, previousF7=false, previousF9=false,previousEsc=false;
     bool oldFocus=foreground;
     ULONGLONG testStart=0, heartbeat=startTick;
@@ -840,7 +860,6 @@ static DWORD WINAPI Worker(void*) {
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         selfModule=module; DisableThreadLibraryCalls(module);
-        HANDLE thread=CreateThread(nullptr,0,Worker,nullptr,0,nullptr); if(thread) CloseHandle(thread);
     } else if (reason == DLL_PROCESS_DETACH && realSetState) {
         XINPUT_VIBRATION zero{};if(testing||ownsOutput)SendMotorOutput(lastController, &zero);
         dualSense.EmergencyStop();

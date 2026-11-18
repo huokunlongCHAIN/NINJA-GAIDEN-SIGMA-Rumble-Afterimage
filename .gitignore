@@ -8,3 +8,5 @@
 *.log
 icon_data.generated.h
 __pycache__/
+/release/SOURCE-CHANGES.patch
+/release/Payload/
